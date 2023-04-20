@@ -1,0 +1,1101 @@
+#!/usr/bin/perl
+use strict;
+use MIME::Base64;
+use File::Basename;
+use Getopt::Long qw(:config bundling no_ignore_case no_autoabbrev passthrough);
+use IO::Handle qw();
+use POSIX;
+
+my ($TRUE,$FALSE) = ("True",undef);
+my ($MASTER_STATUS_OK,$MASTER_STATUS_ERROR) = ("Normal","Error");
+my ($CURRENT_ROLE,$ROLE_IS_MASTER,$ROLE_IS_STANDBY,$ROLE_IS_UNKNOWN,$ROLE_CHECK_SLEEP,$ROLE_CHECK_TIMES) = ("Unknown","Master","Standby","Unknown",6,100);
+my ($STANDBY_STATUS_OK,$STANDBY_STATUS_ERROR,$STANDBY_STATUS_UNCONFIGUED) = ("Synchronized","UnSynchronized","Unconfiged");
+my ($SQL_TIMEOUT,$SQL_SLEEP,$COMMAND_TIMEOUT,$SSH_TEST_TIMEOUT) = (40,30,90,20);
+my ($MAX_HEALTH_CHECK_TIMES,$HEALTH_CHECK_SLEEP,$START_CLUSTER_SLEEP,$COMMAND_FAIL_SLEEP) = (4,1,20,300);
+my ($HEALTH_STATUS_FILE,$HEALTH_CHECK_FILE) = ($ENV{"HOME"}."/.gpdbcluster.health.status",$ENV{"HOME"}."/.gpdbcluster.health.check");
+my ($SQL_DELIM,$RECORD_SPLIT) = (chr(3).chr(4).chr(8),chr(5).chr(6).chr(9).chr(10));
+my ($FIRST_CHECK_STANDBY_PROCESS) = ($TRUE);
+
+#Health Status
+my ($HS_PID,$HS_PGUSER,$HS_M_PGDD,$HS_M_HSNM,$HS_M_PORT,$HS_M_STAT,$HS_S_PGDD,$HS_S_HSNM,$HS_S_PORT,$HS_S_STAT,$HS_V_IP,$HS_REOURCE,
+    $HS_ENABLE_RECOVER,$HS_ENABLE_REBALANCE,$MAX_CONTENT);
+my @HEALTH_STATUS_LIST = (\$HS_PID,\$HS_PGUSER,\$HS_M_PGDD,\$HS_M_HSNM,\$HS_M_PORT,\$HS_M_STAT,\$HS_S_PGDD,\$HS_S_HSNM,\$HS_S_PORT,\$HS_S_STAT,\$HS_V_IP,\$HS_REOURCE,
+    \$HS_ENABLE_RECOVER,\$HS_ENABLE_REBALANCE,\$MAX_CONTENT);
+my $HOSTS_SPLIT = 'HOSTS-'.chr(0).'-SPLIT';
+my @HOST_CONTENT_LIST;
+my ($DATABASE_VERSION);
+my ($CURRENT_HOSTNAME);
+my ($INSTANCE_CHECKSUM,$ACTIVATE_STANDBY_TIMES,$RECOVER_TIMES,$REBALANCE_TIMES,$RESYNC_STANDBY_TIMES,$START_CLUSTER_TIMES,$STOP_MASTER_TIMES) = (undef,0,0,0,0,0,0);
+
+my ($OPR_START,$OPR_STOP,$OPR_STATUS,$START_ROLE,$IS_HELP,$VERSION);
+
+my ($LOG_FILE_DATE,$LOG_FILE_HANDLE,$HEALTH_STATUS_FILE_HANDLE,$HEALTH_CHECK_FILE_HANDLE);
+(my $CMD_NAME = $0) =~ s!.*/(.*)!$1!;
+my $CMD_PATH = dirname(__FILE__);
+my $MAIN_PID = substr("000000".$$,-6);
+my $CMD_GREP = "ps ax|grep -w $CMD_NAME|grep '\\-\\-md'|grep '\\-\\-mh'|grep '\\-\\-mp'|grep '\\-\\-sd'|grep '\\-\\-vip'|grep -vw grep";
+
+my $SQL_GET_STANDBY_STATUS = qq{SELECT
+(SELECT fselocation FROM pg_filespace_entry WHERE fsefsoid = 3052 AND fsedbid = (SELECT dbid FROM gp_segment_configuration WHERE content = -1 AND role = 'm')),
+(SELECT sync_state FROM pg_stat_get_wal_senders() AS w(pid, state, sent_location, write_location, flush_location, replay_location, sync_priority, sync_state)),
+max(hostname),max(port)
+FROM gp_segment_configuration WHERE content = -1 AND role = 'm';};
+my $SQL_GET_STANDBY_STATUS_V6 = qq{SELECT
+(SELECT datadir FROM gp_segment_configuration WHERE content = -1 AND role = 'm'),
+(SELECT sync_state FROM pg_stat_get_wal_senders() AS w(pid, state, sent_location, write_location, flush_location, replay_location, sync_priority, sync_state)),
+max(hostname),max(port)
+FROM gp_segment_configuration WHERE content = -1 AND role = 'm';};
+my $SQL_HEALTH_STATUS = qq{SELECT
+(SELECT fselocation FROM pg_filespace_entry WHERE fsefsoid = 3052 AND fsedbid = (SELECT dbid FROM gp_segment_configuration WHERE content = -1 AND role = 'p')),
+max(hostname) FILTER (WHERE content = -1 AND role = 'p'),
+max(port) FILTER (WHERE content = -1 AND role = 'p'),
+max(hostname) FILTER (WHERE content = -1 AND role = 'm'),
+max(port) FILTER (WHERE content = -1 AND role = 'm'),
+max(content)
+FROM gp_segment_configuration;};
+my $SQL_HEALTH_STATUS_V6 = qq{SELECT
+(SELECT datadir FROM gp_segment_configuration WHERE content = -1 AND role = 'p'),
+max(hostname) FILTER (WHERE content = -1 AND role = 'p'),
+max(port) FILTER (WHERE content = -1 AND role = 'p'),
+max(hostname) FILTER (WHERE content = -1 AND role = 'm'),
+max(port) FILTER (WHERE content = -1 AND role = 'm'),
+max(content)
+FROM gp_segment_configuration;};
+
+my $HELP_MESSAGE = qq#COMMAND NAME: $CMD_NAME
+Auto switch master and standby role.
+
+Developed by Miao Chen
+
+Work Email:
+michen\@pivotal.io
+Private Email:
+miaochen\@mail.ustc.edu.cn
+
+************************************************************************************************
+SYNOPSIS
+************************************************************************************************
+$CMD_NAME [--user | -u gp admin user]
+    [--port master port]
+    [--vip virtual ip address]
+    [--start]
+    [--stop]
+    [--status]
+    [--resource]
+    [--recover]
+    [--rebalance]
+    [-h|--help]
+    [--version]
+*****************************************************
+DESCRIPTION
+*****************************************************
+The $CMD_NAME utility is used to auto switch role between master and standby.
+Auto start greenplum cluster if cluster is down when first start this command.
+
+Before you run this command, you must make sure {gpuser} can use psql to access local master!
+
+Command will log message to log file on path ~/gpAdminLogs/${CMD_NAME}_{DATE_FLAG}.log.
+*****************************************************
+OPTIONS
+*****************************************************
+
+-u <gp admin user>
+
+  Database admin user's name, the default is gpadmin.
+  eg.:
+  -u gpadmin
+
+--port <master port>
+
+  Database port which master used, the default is 5432.
+  eg.:
+  -p 5432
+  
+--vip <virtual ip address>
+
+  You should specify it as format:
+  IP:MASK:DEV
+  eg.:
+  192.168.1.254:24:eth0
+
+--start
+
+  Start $CMD_NAME utility and auto switch to backend runnning.
+
+--stop
+
+  Stop $CMD_NAME utility, will try to clean auto switch progress on Master and Standby.
+
+--status
+
+  Show cluster status from status file, and current process information.
+
+--resource
+
+  Specify a command which will be executed when cluster try to start or exit or activate Standby with parameter START or STOP.
+
+--recover
+
+  Whether run gprecoverseg when some segment instance fail down.
+
+--rebalance
+
+  Whether run gprecoverseg -r when some segment instance not run as preferred role.
+
+-h|--help
+  Displays the online help.
+
+--version
+
+  Displays the command version.
+
+Examples:
+$CMD_NAME --vip '192.168.88.123:24:eth0' -v --start
+$CMD_NAME --status
+$CMD_NAME --stop
+#;
+
+sub trim{
+    my ($string) = @_;
+    $string =~ s/(^\s+|\s+$)//g;
+    return $string;
+}
+sub printMessage{
+    my ($flag,$message) = @_;
+    my $time_flag = strftime("%Y%m%d:%H:%M:%S.",localtime).$MAIN_PID;
+    $message = "$time_flag-[$flag]-:$message\n";
+    if("ERROR" eq $flag){
+        print STDERR $message;
+    }else{
+        print STDOUT $message;
+    }
+    return $message;
+}
+sub logMessage{
+    my ($flag,$message) = @_;
+    my $log_message = printMessage($flag,$message);
+    my $log_file_date = strftime("%Y%m%d",localtime);
+    my $log_path = $ENV{"HOME"}."/gpAdminLogs";
+    if(not -e $log_path){
+        system("mkdir $log_path");
+    }
+    if($log_file_date ne $LOG_FILE_DATE){
+        if($LOG_FILE_HANDLE != ""){
+            close($LOG_FILE_HANDLE);
+        }
+        $LOG_FILE_DATE = $log_file_date;
+        my $log_file = $log_path."/".$CMD_NAME."_".$LOG_FILE_DATE.".log";
+        open($LOG_FILE_HANDLE,">>",$log_file);
+        $LOG_FILE_HANDLE->autoflush(1);
+        if($OPR_STATUS eq ""){
+            printMessage("INFO","Current log file is: ".$log_file);
+        }
+    }
+    print $LOG_FILE_HANDLE $log_message;
+}
+sub errorMessage{
+    my ($message) = @_;
+    logMessage("ERROR",$message);
+    print "Usage: $CMD_NAME [-h|--help] [options]\n";
+    exitMain(1);
+}
+sub executeCommand{
+    my ($command) = @_;
+    my $output = readpipe($command);
+    my $exit_code = $? >> 8;
+    $output = trim($output);
+    if($exit_code != 0){
+        logMessage("WARN","Execute command:\n".$command." Occur error".($output eq "" ? "" : "\n".$output));
+    }
+    return ($exit_code,$output);
+}
+sub getOption{
+    GetOptions(
+        'user|u:s'      => \$HS_PGUSER,
+        'md:s'          => \$HS_M_PGDD,
+        'mh:s'          => \$HS_M_HSNM,
+        'port|mp:s'     => \$HS_M_PORT,
+        'sd:s'          => \$HS_S_PGDD,
+        'sh:s'          => \$HS_S_HSNM,
+        'sp:s'          => \$HS_S_PORT,
+        'vip:s'         => \$HS_V_IP,
+        'start!'        => \$OPR_START,
+        'stop!'         => \$OPR_STOP,
+        'status!'       => \$OPR_STATUS,
+        'start-role:s'  => \$START_ROLE,
+        'resource:s'    => \$HS_REOURCE,
+        'recover!'      => \$HS_ENABLE_RECOVER,
+        'rebalance!'    => \$HS_ENABLE_REBALANCE,
+        'h|help!'       => \$IS_HELP,
+        'version!'      => \$VERSION,
+    );
+    if(@ARGV != 0){
+        errorMessage("Some parameters unknown: [@ARGV]\nPlease refer to $CMD_NAME --help");
+    }
+    if($IS_HELP){
+        print $HELP_MESSAGE;
+        exit 0;
+    }
+    if($VERSION){
+        print "$CMD_NAME 0.1\n";
+        exit 0;
+    }
+}
+sub checkOption{
+    if("" eq $HS_PGUSER){
+        $HS_PGUSER = "gpadmin";
+        if($OPR_STATUS eq ""){
+            logMessage("WARN","Not specify -u, use default($HS_PGUSER)");
+        }
+    }
+    if("" eq $HS_M_PORT){
+        $HS_M_PORT = "5432";
+        if($OPR_STATUS eq ""){
+            logMessage("WARN","Not specify -p, use default($HS_M_PORT)");
+        }
+    }
+    if($OPR_START + $OPR_STOP + $OPR_STATUS > 1){
+        errorMessage("Can't specify --start or --stop or --status at the same time");
+    }
+    my ($code,$output) = executeCommand(qq(id $HS_PGUSER 2>&1));
+    if($code != 0){
+        errorMessage("No such user: $HS_PGUSER");
+    }
+}
+sub queryResult{
+    my ($query_sql) = @_;
+    my $CMDS = "sudo timeout -s 9 $COMMAND_TIMEOUT sudo -iu $HS_PGUSER sh <<'END_OF_COMMAND'\n";
+    $CMDS = $CMDS."PGOPTIONS='-c client_encoding=UTF8' PGHOST='$HS_M_HSNM' PGDATABASE='template1' PGPORT=$HS_M_PORT PGUSER='$HS_PGUSER' ";
+    local $/ = $RECORD_SPLIT;
+    $CMDS = $CMDS."timeout -s 9 $SQL_TIMEOUT psql -R '$/' -qtAXF '$SQL_DELIM' -v ON_ERROR_STOP=1 2>&1 <<'END_OF_SQL'\n";
+    $CMDS = $CMDS.$query_sql."\n";
+    $CMDS = $CMDS."END_OF_SQL\n";
+    $CMDS = $CMDS."END_OF_COMMAND\n";
+    my @result = readpipe($CMDS);
+    my $return_code = $? >> 8;
+    chomp(@result);
+    local $/ = chr(10);
+    chomp($result[-1]) if (@result > 0);
+    my @rows = ();
+    my @result_set = ();
+    for my $row(@result){
+        my @row = split(/$SQL_DELIM/,$row);
+        push @result_set,[@row];
+        push @rows,join(" | ",@row);
+    }
+    return ($return_code,join("\n",@rows),\@result_set);
+}
+sub createHealthStatusFile{
+    if(not -f $HEALTH_STATUS_FILE){
+        system(qq{touch $HEALTH_STATUS_FILE});
+    }
+    if(not -f $HEALTH_CHECK_FILE){
+        system(qq{touch $HEALTH_CHECK_FILE});
+    }
+}
+sub openHealthStatusFile{
+    my ($type) = @_;
+    closeHealthStatusFile();
+    if(not open($HEALTH_STATUS_FILE_HANDLE, $type, $HEALTH_STATUS_FILE)){
+        errorMessage("Can't open status file: $HEALTH_STATUS_FILE");
+    }
+    if(not open($HEALTH_CHECK_FILE_HANDLE, $type, $HEALTH_CHECK_FILE)){
+        errorMessage("Can't open status file: $HEALTH_CHECK_FILE");
+    }
+    $HEALTH_STATUS_FILE_HANDLE->autoflush(1);
+    $HEALTH_CHECK_FILE_HANDLE->autoflush(1);
+}
+sub closeHealthStatusFile{
+    if($HEALTH_STATUS_FILE_HANDLE){
+        close $HEALTH_STATUS_FILE_HANDLE;
+        $HEALTH_STATUS_FILE_HANDLE = undef;
+    }
+    if($HEALTH_CHECK_FILE_HANDLE){
+        close $HEALTH_CHECK_FILE_HANDLE;
+        $HEALTH_STATUS_FILE_HANDLE = undef;
+    }
+}
+sub readHealthStatus{
+    openHealthStatusFile('<');
+    my ($base_size,$check_size,$to_base_host,$to_check_host) = (0,0,$FALSE,$FALSE);
+    my (@bases,@base_hosts,@checks,@check_hosts);
+    while(my $line = <$HEALTH_STATUS_FILE_HANDLE>){
+        $line = trim($line);
+        if($line eq $HOSTS_SPLIT){
+            $to_base_host = $TRUE;
+            next;
+        }
+        if($to_base_host eq $FALSE){
+            push @bases,trim($line);
+        }else{
+            my ($hostname,$status,$contents) = split(/:/,$line);
+            push @base_hosts,([$hostname,$status,$contents]);
+        }
+        $base_size += 1;
+    }
+    while(my $line = <$HEALTH_CHECK_FILE_HANDLE>){
+        $line = trim($line);
+        if($line eq $HOSTS_SPLIT){
+            $to_check_host = $TRUE;
+            next;
+        }
+        if($to_check_host eq $FALSE){
+            push @checks,trim($line);
+        }else{
+            my ($hostname,$status,$contents) = split(/:/,$line);
+            push @check_hosts,([$hostname,$status,$contents]);
+        }
+        $check_size += 1;
+    }
+    my @expects;
+    if($base_size >= $check_size){
+        @expects = @bases;
+        @HOST_CONTENT_LIST = @base_hosts;
+    }else{
+        @expects = @checks;
+        @HOST_CONTENT_LIST = @check_hosts;
+    }
+    for my $index(0 .. @HEALTH_STATUS_LIST - 1){
+        my $reference = $HEALTH_STATUS_LIST[$index];
+        $$reference = $expects[$index];
+    }
+    if($HS_PGUSER eq "" || $HS_M_PGDD eq "" || $HS_M_HSNM eq "" || $HS_M_PORT eq "" || @HOST_CONTENT_LIST < 1){
+        logMessage("WARN","Can not get normal information from status files.\nYou should make sure that the cluster is normal before the first time run this command.");
+        exitMain(1);
+    }
+    my $current_hostname = lc(trim(readpipe("hostname")));
+    if($CURRENT_ROLE eq $ROLE_IS_MASTER && $HS_M_HSNM ne $current_hostname){
+        $HS_M_HSNM = $current_hostname;
+    }
+    closeHealthStatusFile();
+}
+sub writeHealthStatus{
+    openHealthStatusFile('>');
+    for my $reference(@HEALTH_STATUS_LIST){
+        print $HEALTH_STATUS_FILE_HANDLE $$reference."\n";
+    }
+    print $HEALTH_STATUS_FILE_HANDLE $HOSTS_SPLIT."\n";
+    for my $row(@HOST_CONTENT_LIST){
+        my ($hostname,$status,$contents) = @$row;
+        print $HEALTH_STATUS_FILE_HANDLE $hostname.":".$status.":".$contents."\n";
+    }
+    for my $reference(@HEALTH_STATUS_LIST){
+        print $HEALTH_CHECK_FILE_HANDLE $$reference."\n";
+    }
+    print $HEALTH_CHECK_FILE_HANDLE $HOSTS_SPLIT."\n";
+    for my $row(@HOST_CONTENT_LIST){
+        my ($hostname,$status,$contents) = @$row;
+        print $HEALTH_CHECK_FILE_HANDLE $hostname.":".$status.":".$contents."\n";
+    }
+    closeHealthStatusFile();
+}
+sub checkMasterOrStandby{
+    my $master_data_directory = "";
+    if($START_ROLE eq "Standby"){
+        $master_data_directory = $HS_S_PGDD;
+    }elsif($START_ROLE eq "Master"){
+        $master_data_directory = $HS_M_PGDD;
+    }
+    if($master_data_directory eq ""){
+        my ($code,$output) = executeCommand(qq(sudo timeout -s 9 $SQL_TIMEOUT sudo -iu $HS_PGUSER sh -c 'echo \$MASTER_DATA_DIRECTORY' 2>&1));
+        if($code == 0){
+            $master_data_directory = $output;
+        }
+    }
+    if($master_data_directory eq ""){
+        errorMessage("Master data directory is not found");
+    }
+    my ($code,$output) = executeCommand(qq(sudo timeout -s 9 $SQL_TIMEOUT sudo -iu $HS_PGUSER sh 2>&1 <<'END_OF_COMMAND'
+if [ -e "$master_data_directory" ];then pg_controldata $master_data_directory|grep 'Database cluster state'|awk -F ':' '{print \$NF}';else exit 1;fi
+END_OF_COMMAND));
+    if($code == 0){
+        if($output eq "in standby mode"){
+            $CURRENT_ROLE = $ROLE_IS_STANDBY;
+        }else{
+            $CURRENT_ROLE = $ROLE_IS_MASTER;
+            if($HS_M_HSNM eq ""){
+                $HS_M_HSNM = lc(trim(readpipe("hostname")));
+            }
+        }
+    }else{
+        $CURRENT_ROLE = $ROLE_IS_UNKNOWN;
+        return $CURRENT_ROLE;
+    }
+    ($code,$output) = executeCommand(qq(sudo timeout -s 9 $SQL_TIMEOUT sudo -iu $HS_PGUSER sh 2>&1 <<'END_OF_COMMAND'
+if [ -e "$master_data_directory" ];then pg_controldata $master_data_directory|grep 'Catalog version number'|awk -F ':' '{print \$NF}';else exit 1;fi
+END_OF_COMMAND));
+    if($code == 0){
+        $DATABASE_VERSION = int($output) >= 301705051 ? int($output) >= 301908232 ? 6 : 5 : 4;
+    }else{
+        errorMessage("Get database version occur error: $output");
+    }
+    return $CURRENT_ROLE;
+}
+sub checkStandbyIsAlive{
+    if($HS_S_HSNM eq ""){
+        return $FALSE;
+    }
+    logMessage("INFO","Check whether Standby is activated");
+    my ($code,$output) = executeCommand(qq{sudo timeout -s 9 $COMMAND_TIMEOUT sudo -iu $HS_PGUSER ssh $HS_S_HSNM -T "ps ax|grep postgres|grep -v grep|grep -w '\\-D'|grep -w '\\-p $HS_S_PORT'|wc -l" 2> /dev/null});
+    if($code == 0 && $output eq "0"){
+        return $FALSE;
+    }else{
+        return $TRUE;
+    }
+}
+sub checkStandbyIsActivated{
+    if($HS_S_HSNM eq ""){
+        return $FALSE;
+    }
+    logMessage("INFO","Check whether Standby is activated");
+    my ($code,$output) = executeCommand(qq{sudo timeout -s 9 $COMMAND_TIMEOUT sudo -iu $HS_PGUSER ssh $HS_S_HSNM -T "timeout -s 9 $SQL_TIMEOUT psql -qtAX -p $HS_S_PORT template1 -c 'select 1;'" 2>&1});
+    if($output =~ /FATAL:.*too many clients/ || $output =~ /FATAL:.*too many connections/){
+        logMessage("WARN","Occur too many connections error, will ignore it, please check the database status");
+        $code = 0;
+    }
+    if($code == 0){
+        return $TRUE;
+    }else{
+        return $FALSE;
+    }
+}
+sub checkSegmentHostUp{
+    my ($allup) = @_;
+    for my $row(@HOST_CONTENT_LIST){
+        my ($hostname,$status,$contents) = @$row;
+        if($allup eq $FALSE && $status eq "d"){
+            next;
+        }
+        my ($code,$output) = executeCommand(qq{sudo timeout -s 9 $SSH_TEST_TIMEOUT sudo -iu $HS_PGUSER ssh $hostname -T "date" 2>&1});
+        if($code != 0){
+            return $FALSE;
+        }
+    }
+    return $TRUE;
+}
+sub startCluster{
+    if($START_CLUSTER_TIMES >= $MAX_HEALTH_CHECK_TIMES){
+        logMessage("WARN","Have try many times to start cluster, skip to execute any try");
+        sleep($START_CLUSTER_SLEEP);
+        return (1,"");
+    }else{
+        $START_CLUSTER_TIMES += 1;
+    }
+    while($TRUE){
+        logMessage("INFO","Try to check whether segment enough for start cluster");
+        my $status = checkSegmentHostUp($FALSE);
+        if($status eq $FALSE){
+            logMessage("WARN","Have no enough contents to start cluster");
+        }else{
+            last;
+        }
+        sleep($START_CLUSTER_SLEEP);
+    }
+    logMessage("INFO","Try to start cluster normally...");
+    my ($code,$output) = executeCommand(qq{sudo sudo -iu $HS_PGUSER sh -c "gpstart -a" 2>&1});
+    if($code != 0){
+        logMessage("WARN","Failed fo start greenplum cluster, execute gpstop now");
+        executeCommand(qq{sudo sudo -iu $HS_PGUSER sh -c "gpstop -af" 2>&1});
+    }
+    return ($code,$output);
+}
+sub getMasterStatus{
+    my ($once) = @_;
+    my ($try_from,$try_to) = (1,$MAX_HEALTH_CHECK_TIMES);
+    if($TRUE eq $once){
+        $try_to = $try_from;
+    }
+    my $check_sql = qq{select pg_sleep($SQL_SLEEP);};
+    my $timeout = $COMMAND_TIMEOUT + $SQL_SLEEP;
+    my ($output,$code);
+    for my $trys($try_from .. $try_to){
+        if($TRUE eq $once || $trys > $try_from){
+            $check_sql = qq{select 1;};
+            $timeout = $COMMAND_TIMEOUT;
+        }
+        ($code,$output) = executeCommand(qq{sudo timeout -s 9 $timeout sudo -iu $HS_PGUSER sh -c "timeout -s 9 $SQL_TIMEOUT psql -qtAX -h $HS_M_HSNM -p $HS_M_PORT template1 -c '$check_sql'" 2>&1});
+        if($output =~ /FATAL:.*too many clients/ || $output =~ /FATAL:.*too many connections/){
+            logMessage("WARN","Occur too many connections error, will ignore it, please check the database status");
+            $code = 0;
+        }
+        if($code == 0){
+            return ($code,$output);
+        }elsif($trys < $try_to){
+            logMessage("WARN","Check master status occur error, will try again");
+        }
+    }
+    return ($code,$output);
+}
+sub getStandbyStatus{
+    logMessage("INFO","Check standby status");
+    if($HS_M_STAT eq $MASTER_STATUS_ERROR){
+        logMessage("WARN","Master status is not ok, can not get standby status");
+        return;
+    }
+    my ($code,$scalar,$result_set);
+    if($DATABASE_VERSION < 6){
+        ($code,$scalar,$result_set) = queryResult($SQL_GET_STANDBY_STATUS);
+    }else{
+        ($code,$scalar,$result_set) = queryResult($SQL_GET_STANDBY_STATUS_V6);
+    }
+    if($code == 0){
+        my ($pgdd,$sync,$hsnm,$port) = @{$result_set->[0]};
+        ($HS_S_PGDD,$HS_S_HSNM,$HS_S_PORT) = ($pgdd,$hsnm,$port);
+        if($pgdd eq "" || $hsnm eq "" || $port eq ""){
+            $HS_S_STAT = $STANDBY_STATUS_UNCONFIGUED;
+            logMessage("INFO","Standby is unconfigured");
+            return $HS_S_STAT;
+        }
+        if($sync eq "sync"){
+            $HS_S_STAT = $STANDBY_STATUS_OK;
+        }else{
+            $HS_S_STAT = $STANDBY_STATUS_ERROR;
+        }
+        logMessage("INFO","Standby status: $HS_S_STAT");
+        return $HS_S_STAT;
+    }else{
+        logMessage("WARN","Get standby configuration from master occur error");
+        return $FALSE;
+    }
+}
+sub checkStandbyProcess{
+    logMessage("INFO","Check standby process information");
+    if($HS_S_STAT eq $STANDBY_STATUS_UNCONFIGUED){
+        logMessage("INFO","Standby is unconfigured");
+        return;
+    }
+    my ($code,$procpid) = executeCommand(qq{set -o pipefail;ssh $HS_S_HSNM -T "$CMD_GREP|head -n 1"|}.q(awk '{print $1}'));
+    if($code == 0){
+        if($FIRST_CHECK_STANDBY_PROCESS && $procpid ne ""){
+            logMessage("INFO","Standby exists residual process");
+            executeCommand(qq{ssh $HS_S_HSNM -T "sudo kill -9 $procpid"});
+            $procpid = "";
+        }
+        $FIRST_CHECK_STANDBY_PROCESS = $FALSE;
+        if($HS_S_STAT eq $STANDBY_STATUS_OK && $procpid eq ""){
+            logMessage("INFO","Standby process id not exists, overwrite command file and start backend command");
+            executeCommand(qq{ssh $HS_S_HSNM -T "sudo rm -f /tmp/$CMD_NAME" 2>&1});
+            executeCommand(qq{scp $CMD_PATH/$CMD_NAME $HS_S_HSNM:/tmp/$CMD_NAME 2>&1});
+            executeCommand(qq{ssh $HS_S_HSNM -T "umask 0022;sudo chmod 755 /tmp/$CMD_NAME" 2>&1});
+            my $start = qq{ssh $HS_S_HSNM -T "nohup /tmp/$CMD_NAME -u $HS_PGUSER --md $HS_M_PGDD --mh $HS_M_HSNM --mp $HS_M_PORT};
+            $start = $start.qq{ --sd $HS_S_PGDD --sh $HS_S_HSNM --sp $HS_S_PORT --vip '$HS_V_IP'}." --start-role Standby";
+            $start = $start.qq{ --resource '$HS_REOURCE'}.($HS_ENABLE_RECOVER ? " --recover" : "").($HS_ENABLE_REBALANCE ? " --rebalance" : "").qq{ > /dev/null 2>&1 &"};
+            executeCommand($start);
+        }elsif($HS_S_STAT ne $STANDBY_STATUS_OK && $procpid ne ""){
+            logMessage("INFO","Standby status is not good, kill monitor process");
+            executeCommand(qq{ssh $HS_S_HSNM -T "sudo kill -9 $procpid"});
+        }elsif($HS_S_STAT eq $STANDBY_STATUS_OK && $procpid ne ""){
+            logMessage("INFO","Standby monitor process id: $procpid");
+        }else{
+            logMessage("INFO","Standby status: $HS_S_STAT");
+        }
+    }else{
+        logMessage("WARN","Check standby process occur error");
+    }
+}
+sub updateHealthStatus{
+    if($HS_M_STAT eq $MASTER_STATUS_OK){
+        my ($code1,$scalar1,$result_set1);
+        if($DATABASE_VERSION < 6){
+            ($code1,$scalar1,$result_set1) = queryResult($SQL_HEALTH_STATUS);
+        }else{
+            ($code1,$scalar1,$result_set1) = queryResult($SQL_HEALTH_STATUS_V6);
+        }
+        my ($code2,$scalar2,$result_set2) = queryResult(qq{SELECT hostname,max(status),string_agg(content::text,',') FROM gp_segment_configuration WHERE content > -1 GROUP BY 1;});
+        if($code1 == 0 && $code2 == 0){
+            ($HS_M_PGDD,$HS_M_HSNM,$HS_M_PORT,$HS_S_HSNM,$HS_S_PORT,$MAX_CONTENT) = @{$result_set1->[0]};
+            $HS_PID = $$;
+            @HOST_CONTENT_LIST = ();
+            for my $row(@$result_set2){
+                my ($hostname,$status,$contents) = @$row;
+                push @HOST_CONTENT_LIST,[($hostname,$status,$contents)];
+            }
+        }else{
+            return $FALSE;
+        }
+    }
+    writeHealthStatus();
+    return $TRUE;
+}
+sub firstCheckMasterStatus{
+    my ($code,$output) = getMasterStatus($TRUE);
+    if($code == 0){
+        logMessage("INFO","Current Master status is OK");
+        $HS_M_STAT = $MASTER_STATUS_OK;
+        getStandbyStatus();
+        updateHealthStatus();
+        return $TRUE;
+    }else{
+        logMessage("WARN","Current Master status is BAD");
+        readHealthStatus();
+        my $alive = checkStandbyIsAlive();
+        if($alive eq $FALSE){
+            ($code,$output) = startCluster();
+            if($code != 0){
+                return $FALSE;
+            }else{
+                logMessage("INFO","Start cluster success");
+                $HS_M_STAT = $MASTER_STATUS_OK;
+                getStandbyStatus();
+                updateHealthStatus();
+                return $TRUE;
+            }
+        }else{
+            my $activate = checkStandbyIsActivated();
+            if($activate eq $TRUE){
+                logMessage("WARN","Standby have been activated, will exit");
+                exitMain(0);
+            }
+            logMessage("WARN","Standby maybe is alive, will check later");
+            return $FALSE;
+        }
+    }
+}
+sub getClusterSegmentStatus{
+    if($HS_ENABLE_RECOVER eq undef){
+        return ($TRUE,0,0,0,"");
+    }
+    queryResult(qq{CHECKPOINT;});
+    my ($code,$scalar,$result_set) = queryResult(qq{SELECT
+    count(*) FILTER (WHERE status = 'd'),
+    count(*) FILTER (WHERE mode = 'r'),
+    count(*) FILTER (WHERE preferred_role <> role),
+    md5(string_agg(dbid||status||'|'||mode||'|'||preferred_role||'|'||role,',' ORDER BY dbid ASC))
+FROM gp_segment_configuration WHERE content >= 0;});
+    if($code == 0){
+        my ($down,$resync,$failover,$checksum) = @{$result_set->[0]};
+        return ($TRUE,$down,$resync,$failover,$checksum);
+    }else{
+        return ($FALSE,0,0,0,"");
+    }
+}
+sub executeSegmentRecover{
+    my ($checksum) = @_;
+    if($HS_ENABLE_RECOVER eq undef){
+        return $TRUE;
+    }
+    my $status = checkSegmentHostUp($TRUE);
+    if($status eq $FALSE){
+        logMessage("WARN","Not all segment host is up");
+        return $FALSE;
+    }
+    if($INSTANCE_CHECKSUM eq $checksum){
+        $RECOVER_TIMES += 1;
+    }else{
+        ($INSTANCE_CHECKSUM,$RECOVER_TIMES) = ($checksum,0);
+    }
+    if($RECOVER_TIMES >= $MAX_HEALTH_CHECK_TIMES){
+        logMessage("WARN","Have try many times to execute recover");
+        return $FALSE;
+    }
+    logMessage("INFO","Execute command: gprecoverseg -a");
+    my ($code,$output) = executeCommand(qq{sudo sudo -iu $HS_PGUSER sh 2>&1 <<'END_OF_COMMAND'
+gprecoverseg -a
+END_OF_COMMAND});
+    if($code == 0){
+        logMessage("INFO","Success execute command: gprecoverseg -a");
+        return $TRUE;
+    }else{
+        return $FALSE;
+    }
+}
+sub executeSegmentRebalance{
+    my ($checksum) = @_;
+    if($HS_ENABLE_REBALANCE eq undef){
+        return $TRUE;
+    }
+    if($INSTANCE_CHECKSUM eq $checksum){
+        $REBALANCE_TIMES += 1;
+    }else{
+        ($INSTANCE_CHECKSUM,$REBALANCE_TIMES) = ($checksum,0);
+    }
+    if($REBALANCE_TIMES >= $MAX_HEALTH_CHECK_TIMES){
+        logMessage("WARN","Have try many times to execute rebalance");
+        return $FALSE;
+    }
+    logMessage("INFO","Execute command: gprecoverseg -a -r");
+    my ($code,$output) = executeCommand(qq{sudo sudo -iu $HS_PGUSER sh 2>&1 <<'END_OF_COMMAND'
+gprecoverseg -a -r
+END_OF_COMMAND});
+    if($code == 0){
+        logMessage("INFO","Success execute command: gprecoverseg -a -r");
+        return $TRUE;
+    }else{
+        return $FALSE;
+    }
+}
+sub stopMaster{
+    if($STOP_MASTER_TIMES >= $MAX_HEALTH_CHECK_TIMES){
+        logMessage("WARN","Have try many times to stop master, try again after $COMMAND_FAIL_SLEEP seconds");
+        sleep($COMMAND_FAIL_SLEEP);
+    }else{
+        $STOP_MASTER_TIMES += 1;
+    }
+    my ($code,$output) = executeCommand(qq{ping $HS_M_HSNM -c 1 -w 1 2>&1});
+    if($code == 0){
+        logMessage("INFO","Master is still alive, try to stop master");
+        ($code,$output) = executeCommand(qq{sudo timeout $COMMAND_TIMEOUT sudo -u $HS_PGUSER ssh $HS_M_HSNM -T "ps ax|grep postgres|grep -v grep|grep -w '\\-D'|grep -w '\\-p $HS_M_PORT'}.q(|awk '{print \\$1}' 2> /dev/null"));
+        if($code == 0 && $output eq ""){
+            logMessage("INFO","Execute command on $HS_M_HSNM: rm -f /tmp/.s.PGSQL.$HS_M_PORT /tmp/.s.PGSQL.$HS_M_PORT.lock");
+            executeCommand(qq(sudo sudo -u $HS_PGUSER ssh $HS_M_HSNM -T "rm -f /tmp/.s.PGSQL.$HS_M_PORT /tmp/.s.PGSQL.$HS_M_PORT.lock"));
+            $STOP_MASTER_TIMES = 0;
+            return $TRUE;
+        }
+        logMessage("INFO","Execute command on $HS_M_HSNM: pg_ctl stop -D $HS_M_PGDD -m immediate");
+        ($code,$output) = executeCommand(qq{sudo sudo -iu $HS_PGUSER ssh $HS_M_HSNM -T "pg_ctl stop -D $HS_M_PGDD -m immediate 2>&1"});
+        if($code != 0){
+            executeCommand(qq{sudo timeout $COMMAND_TIMEOUT sudo -u $HS_PGUSER ssh $HS_M_HSNM -T "ps ax|grep postgres|grep -v grep|grep -w '\\-D'|grep -w '\\-p $HS_M_PORT'}.q(|awk '{print \\$1}|xargs -i kill -9 {}' 2> /dev/null"));
+        }
+        ($code,$output) = executeCommand(qq{sudo timeout $COMMAND_TIMEOUT sudo -u $HS_PGUSER ssh $HS_M_HSNM -T "ps ax|grep postgres|grep -v grep|grep -w '\\-D'|grep -w '\\-p $HS_M_PORT'}.q(|awk '{print \\$1}' 2> /dev/null"));
+        if($code == 0 && $output eq ""){
+            logMessage("INFO","Execute command on $HS_M_HSNM: rm -f /tmp/.s.PGSQL.$HS_M_PORT /tmp/.s.PGSQL.$HS_M_PORT.lock");
+            executeCommand(qq(sudo sudo -u $HS_PGUSER ssh $HS_M_HSNM -T "rm -f /tmp/.s.PGSQL.$HS_M_PORT /tmp/.s.PGSQL.$HS_M_PORT.lock"));
+            $STOP_MASTER_TIMES = 0;
+            return $TRUE;
+        }else{
+            return $FALSE;
+        }
+    }else{
+        logMessage("WARN","Failed to ping remote Master Host, Try again from other segment hosts");
+        for my $row(@HOST_CONTENT_LIST){
+            my ($hostname,$status,$contents) = @$row;
+            ($code,$output) = executeCommand(qq{sudo timeout $COMMAND_TIMEOUT sudo -iu $HS_PGUSER ssh $hostname -T "ping $HS_M_HSNM -c 1 -w 1" 2>&1});
+            if($code == 0){
+                logMessage("WARN","Some segment host always can ping to master: $hostname");
+                return $FALSE;
+            }
+        }
+        $STOP_MASTER_TIMES = 0;
+        return $TRUE;
+    }
+}
+sub resyncStandby{
+    if($HS_S_STAT eq $STANDBY_STATUS_UNCONFIGUED){
+        return;
+    }
+    my ($code,$output) = executeCommand(qq{sudo timeout -s 9 $SSH_TEST_TIMEOUT sudo -iu $HS_PGUSER ssh $HS_S_HSNM -T "date" 2>&1});
+    if($code != 0){
+        return $FALSE;
+    }
+    if($RESYNC_STANDBY_TIMES < $MAX_HEALTH_CHECK_TIMES){
+        $RESYNC_STANDBY_TIMES += 1;
+        logMessage("INFO","Execute command: gpinitstandby -a -n");
+        executeCommand(qq{sudo sudo -iu $HS_PGUSER sh -c "gpinitstandby -a -n" 2>&1});
+    }else{
+        logMessage("WARN","Have try many times to execute resync standby");
+    }
+}
+sub startMasterListener{
+    while($TRUE){
+        my ($code,$output) = getMasterStatus();
+        if($code == 0){
+            $HS_M_STAT = $MASTER_STATUS_OK;
+            logMessage("INFO","Local Master status OK");
+            my $status = getStandbyStatus();
+            if($status ne $STANDBY_STATUS_OK){
+                my $activate = checkStandbyIsActivated();
+                if($activate eq $TRUE){
+                    logMessage("WARN","Local Master is OK but Remote standby is activated, exit");
+                    my $stop = stopMaster();
+                    if($stop eq $TRUE){
+                        exitMain(0);
+                    }
+                }
+            }
+            if($status eq $STANDBY_STATUS_ERROR){
+                resyncStandby();
+            }else{
+                $RESYNC_STANDBY_TIMES = 0;
+            }
+            checkStandbyProcess();
+        }else{
+            $HS_M_STAT = $MASTER_STATUS_ERROR;
+            logMessage("WARN","Local Master status error:\n".$output);
+            if($HS_S_STAT eq $STANDBY_STATUS_OK){
+                stopMaster();
+                my $status = checkStandbyIsActivated();
+                if($status eq $TRUE){
+                    logMessage("WARN","Remote standby is activated, exit");
+                    exitMain(0);
+                }
+            }else{
+                logMessage("WARN","Standby status is: $HS_S_STAT, nothing can do");
+                updateHealthStatus();
+                sleep($SQL_SLEEP + $HEALTH_CHECK_SLEEP);
+                next;
+            }
+        }
+        updateHealthStatus();
+        if($code == 0){
+            my ($status,$down,$resync,$failover,$checksum) = getClusterSegmentStatus();
+            if($status eq $FALSE){
+                logMessage("WARN","Get cluster segment status occur error");
+            }else{
+                if($down != 0 && $resync == 0){
+                    executeSegmentRecover($checksum);
+                }elsif($down == 0 && $resync == 0 && $failover != 0){
+                    executeSegmentRebalance($checksum);
+                }elsif($down != 0 && $resync != 0){
+                    logMessage("WARN","Can not solve the problem as have instance down when have instance resync");
+                }else{
+                    ($INSTANCE_CHECKSUM,$RECOVER_TIMES,$REBALANCE_TIMES) = ($checksum,0,0);
+                }
+            }
+        }
+        sleep($HEALTH_CHECK_SLEEP);
+    }
+}
+sub switchMasterAndStandby{
+    my $status = checkStandbyIsActivated();
+    if($status eq $TRUE){
+        ($HS_M_PGDD,$HS_M_HSNM,$HS_M_PORT,$HS_M_STAT,$HS_S_STAT) = ($HS_S_PGDD,$HS_S_HSNM,$HS_S_PORT,$MASTER_STATUS_OK,$STANDBY_STATUS_UNCONFIGUED);
+        updateHealthStatus();
+    }
+    return $status;
+}
+sub activateStandby{
+    if($ACTIVATE_STANDBY_TIMES >= $MAX_HEALTH_CHECK_TIMES){
+        logMessage("WARN","Have try many times to activate standby, try again after $COMMAND_FAIL_SLEEP seconds");
+        sleep($COMMAND_FAIL_SLEEP);
+    }else{
+        $ACTIVATE_STANDBY_TIMES += 1;
+    }
+    my $command = qq{sudo sudo -iu $HS_PGUSER sh -c "export PGPORT=$HS_S_PORT;gpactivatestandby -a -d $HS_S_PGDD 2>&1"};
+    my ($code,$output) = executeCommand($command);
+    if($code != 0){
+        logMessage("WARN","Activate standby occur error:\n".$output);
+    }
+    return switchMasterAndStandby();
+}
+sub startStandbyListener{
+    while($TRUE){
+        my ($code,$output) = getMasterStatus();
+        if($code == 0){
+            $HS_M_STAT = $MASTER_STATUS_OK;
+            logMessage("INFO","Remote Master status OK");
+        }else{
+            $HS_M_STAT = $MASTER_STATUS_ERROR;
+            logMessage("WARN","Remote Master status error:\n".$output);
+        }
+        if($code == 0){
+            updateHealthStatus();
+        }else{
+            my $status = stopMaster();
+            if($status eq $TRUE){
+                my $status = activateStandby();
+                if($status eq $TRUE){
+                    return;
+                }
+            }
+        }
+        sleep($HEALTH_CHECK_SLEEP);
+    }
+}
+sub bindLocalVirtualIp{
+    if($HS_V_IP eq ""){
+        return $TRUE;
+    }
+    my ($vip,$vmask,$vdev) = split(/:/,$HS_V_IP);
+    logMessage("INFO","Try to add virtual ipaddress: ip addr add $vip/$vmask dev $vdev");
+    executeCommand(qq{sudo ip addr add $vip/$vmask dev $vdev 2>&1});
+}
+sub unbindLocalVirtualIp{
+    if($HS_V_IP eq ""){
+        return $TRUE;
+    }
+    my ($vip,$vmask,$vdev) = split(/:/,$HS_V_IP);
+    my ($code,$output) = executeCommand(qq(sudo ip a|grep -w $vip|sed s'./. .'|awk '{print \$2":"\$3":"\$NF}'));
+    if($output ne ""){
+        my ($curr_ip,$curr_mask,$curr_dev) = split(/:/,$output);
+        logMessage("INFO","Try to delete virtual ipaddress: ip addr del $curr_ip/$curr_mask dev $curr_dev");
+        executeCommand(qq{sudo ip addr del $curr_ip/$curr_mask dev $curr_dev 2>&1});
+    }
+}
+sub startResource{
+    my ($hostname) = @_;
+    if($OPR_START || $OPR_STOP || $OPR_STATUS || $HS_REOURCE eq "" || $hostname eq ""){
+        return;
+    }
+    my ($code,$output) = executeCommand(qq{timeout -s 9 $COMMAND_TIMEOUT ssh $hostname -T "sudo -i sh $HS_REOURCE START" 2>&1});
+    if($code == 0){
+        logMessage("INFO","Execute $HS_REOURCE START on $hostname success");
+    }else{
+        logMessage("WARN","Execute $HS_REOURCE START on $hostname occur error:\n".$output);
+    }
+}
+sub stopResource{
+    my ($hostname) = @_;
+    if($OPR_START || $OPR_STOP || $OPR_STATUS || $HS_REOURCE eq "" || $hostname eq ""){
+        return;
+    }
+    my ($code,$output) = executeCommand(qq{timeout -s 9 $COMMAND_TIMEOUT ssh $hostname -T "sudo -i sh $HS_REOURCE STOP" 2>&1});
+    if($code == 0){
+        logMessage("INFO","Execute $HS_REOURCE STOP on $hostname success");
+    }else{
+        logMessage("WARN","Execute $HS_REOURCE STOP on $hostname occur error:\n".$output);
+    }
+}
+sub startProcess{
+    if($OPR_STOP || $OPR_STATUS){
+        return;
+    }
+    my ($code,$procpid) = executeCommand(qq($CMD_GREP|grep -vw $$|head -n 1|awk '{print \$1}'));
+    if($procpid ne "" && $START_ROLE ne "Master"){
+        errorMessage("Process exists with process id: $procpid");
+    }
+    if(not $OPR_START){
+        return;
+    }
+    executeCommand(qq{cp $CMD_PATH/$CMD_NAME /tmp/$CMD_NAME -f 2>&1|tee});
+    my $start = qq{nohup /tmp/$CMD_NAME -u $HS_PGUSER --md $HS_M_PGDD --mh $HS_M_HSNM --mp $HS_M_PORT};
+    $start = $start.qq{ --sd $HS_S_PGDD --sh $HS_S_HSNM --sp $HS_S_PORT --vip '$HS_V_IP'}." --start-role Master";
+    $start = $start.qq{ --resource '$HS_REOURCE'}.($HS_ENABLE_RECOVER ? " --recover" : "").($HS_ENABLE_REBALANCE ? " --rebalance" : "").qq{ > /dev/null 2>&1 &};
+    executeCommand($start);
+    sleep($HEALTH_CHECK_SLEEP);
+    ($code,$procpid) = executeCommand(qq($CMD_GREP|grep -vw $$|head -n 1|awk '{print \$1}'));
+    if($procpid ne ""){
+        logMessage("INFO","Start process success with process id: $procpid");
+        exitMain(0);
+    }else{
+        errorMessage("Start process occur error, not find process id");
+    }
+}
+sub stopProcess{
+    if(not $OPR_STOP){
+        return;
+    }
+    readHealthStatus();
+    my ($m_code,$m_procpid) = executeCommand(qq($CMD_GREP|grep -vw $$|head -n 1|awk '{print \$1}'));
+    if($m_procpid eq ""){
+        logMessage("WARN","No process running currently");
+    }
+    if($HS_S_STAT ne $STANDBY_STATUS_UNCONFIGUED){
+        stopResource($HS_S_HSNM);
+        my ($code,$procpid) = executeCommand(qq(ssh $HS_S_HSNM -T "$CMD_GREP|head -n 1"|awk '{print \$1}'));
+        if($procpid ne ""){
+            logMessage("INFO","Stop process id on standby: $procpid");
+            executeCommand(qq{ssh $HS_S_HSNM -T "sudo kill -9 $procpid" 2>&1});
+        }
+    }
+    if($m_procpid ne ""){
+        logMessage("INFO","Stop process id on master: $m_procpid");
+        executeCommand(qq{sudo kill -9 $m_procpid 2>&1});
+    }
+    exitMain(0);
+}
+sub getStatus{
+    if(not $OPR_STATUS){
+        return;
+    }
+    readHealthStatus();
+    my ($code,$procpid) = executeCommand(qq($CMD_GREP|grep -vw $$|head -n 1|awk '{print \$1}'));
+    my $info1 = "INFO";
+    if($procpid ne ""){
+        $HS_PID = $procpid;
+    }else{
+        $HS_PID = "ERROR (Not found process id, may not be running)";
+        $info1 = "WARN";
+    }
+    my ($standby_procpid,$info2) = ("ERROR (Not found process id, may not be running)","WARN");
+    if($HS_S_STAT ne $STANDBY_STATUS_UNCONFIGUED){
+        ($code,$procpid) = executeCommand(qq(ssh $HS_S_HSNM -T "$CMD_GREP|head -n 1"|awk '{print \$1}'));
+        if($procpid ne ""){
+            ($standby_procpid,$info2) = ($procpid,"INFO");
+        }
+    }
+    logMessage($info1,"  Master process id     : $HS_PID");
+    logMessage($info2,"  Standby process id    : $standby_procpid");
+    logMessage("INFO","  Database Username     : $HS_PGUSER");
+    logMessage("INFO","  Master DataDirectory  : $HS_M_PGDD");
+    logMessage("INFO","  Master Hostname       : $HS_M_HSNM");
+    logMessage("INFO","  Master Database Port  : $HS_M_PORT");
+    logMessage("INFO","  Master Status         : $HS_M_STAT");
+    logMessage("INFO","  Standby DataDirectory : $HS_S_PGDD");
+    logMessage("INFO","  Standby Hostname      : $HS_S_HSNM");
+    logMessage("INFO","  Standby Database Port : $HS_S_PORT");
+    logMessage("INFO","  Standby Status        : $HS_S_STAT");
+    logMessage("INFO","  Virtual IP Address    : ".($HS_V_IP eq "" ? "Unconfiged" : $HS_V_IP));
+    logMessage("INFO","  Resource              : ".($HS_REOURCE eq "" ? "Unconfiged" : $HS_REOURCE));
+    logMessage("INFO","  Enable recovery       : ".($HS_ENABLE_RECOVER eq "" ? "FALSE" : "TRUE"));
+    logMessage("INFO","  Enable rebalance      : ".($HS_ENABLE_REBALANCE eq "" ? "FALSE" : "TRUE"));
+    exitMain(0);
+}
+sub startMain{
+    bindLocalVirtualIp();
+    stopResource($HS_S_HSNM);
+    startResource();
+}
+sub exitMain{
+    my ($code) = @_;
+    if($OPR_START + $OPR_STOP + $OPR_STATUS == 0){
+        unbindLocalVirtualIp();
+        stopResource($CURRENT_HOSTNAME);
+    }
+    closeHealthStatusFile();
+    exit $code;
+}
+sub main{
+    getOption();
+    checkOption();
+    logMessage("INFO","Run command: ".$_[0]);
+    my ($code,$output) = executeCommand("timeout -s 9 6 sudo date > /dev/null 2>&1");
+    if($code != 0){
+        errorMessage("You must run this command use user which can sudo without password");
+    }
+    ($code,$output) = executeCommand(qq{sudo cat /etc/sudoers|grep 'Defaults.*requiretty'|tee});
+    if($output ne "" && !($output =~ /^#/)){
+        errorMessage("You should modify the /etc/sudoers file to disable require tty like:\n#Defaults    requiretty");
+    }
+    umask(0);
+    for my $index(1 .. $ROLE_CHECK_TIMES){
+        checkMasterOrStandby();
+        if($CURRENT_ROLE ne $ROLE_IS_UNKNOWN){
+            last;
+        }
+        logMessage("WARN","Current host is neither Master nor Standby");
+        sleep($ROLE_CHECK_SLEEP);
+    }
+    if($CURRENT_ROLE eq $ROLE_IS_UNKNOWN){
+        logMessage("WARN","Current host is neither Master nor Standby");
+        exitMain(1);
+    }
+    if($CURRENT_ROLE eq $ROLE_IS_STANDBY && $START_ROLE ne "Standby"){
+        logMessage("WARN","Standby script can only be started by Master, exit now");
+        exitMain(1);
+    }
+    if($START_ROLE eq "" && $OPR_START + $OPR_STOP + $OPR_STATUS == 0){
+        logMessage("WARN","Must specify --start or --stop or --status");
+        exitMain(1);
+    }
+    startProcess();
+    stopProcess();
+    getStatus();
+    createHealthStatusFile();
+    #Start Standby script From Master
+    if($START_ROLE eq "Standby"){
+        logMessage("INFO","Current host is standby");
+        $CURRENT_HOSTNAME = $HS_S_HSNM;
+        unbindLocalVirtualIp();
+        stopResource($CURRENT_HOSTNAME);
+        startStandbyListener();
+        startMain();
+        startMasterListener();
+    }else{
+    #Start Master script
+        logMessage("INFO","Current host is master");
+        $CURRENT_HOSTNAME = $HS_M_HSNM;
+        while($TRUE){
+            my $status = firstCheckMasterStatus();
+            if($status eq $TRUE){
+                last;
+            }
+            sleep($HEALTH_CHECK_SLEEP);
+        }
+        startMain();
+        startMasterListener();
+    }
+}
+my $command_string = $0." ".join(" ",@ARGV);
+STDOUT->autoflush(1);
+STDERR->autoflush(1);
+main($command_string);

@@ -1,0 +1,1927 @@
+#!/usr/bin/perl
+use strict;
+use MIME::Base64;
+use threads;
+use Thread::Queue;
+use Getopt::Long qw(:config bundling no_ignore_case no_autoabbrev passthrough);
+use IO::Handle qw();
+use Fcntl qw(:flock);
+use POSIX;
+
+my ($DATABASE_NAME,$PORT,@SCHEMA_ARRAY,@EX_SCHEMA_ARRAY,$TO_FILE,$TARGET_VERSION,$RELOPTION_FILE,$IS_HELP,$VERSION);
+my (%SET_OF_INCLUDE_SCHEMA,$INCLUDE_SCHEMA_SIZE,%SET_OF_EXCLUDE_SCHEMA);
+my (%MAP_OF_RESOURCE_QUEUE,%MAP_OF_RESOURCE_GROUP,%MAP_OF_ROLE,%MAP_OF_TABLESPACE,%MAP_OF_LANGUAGE,%MAP_OF_SCHEMA,%MAP_OF_TYPE,%MAP_OF_AGG,
+    %MAP_OF_FUNCTION_ARGDEF,%MAP_OF_FUNCTION,%MAP_OF_ATTRIBUTE,%MAP_OF_ATTRDEF,%MAP_OF_DISTRIBUTION,%MAP_OF_PARTITION,%MAP_OF_PARTITION_RULE,
+    %MAP_OF_PARTITION_OID,%MAP_OF_TABLECHECK,%MAP_OF_TABLE,%MAP_OF_VIEW_DEPTH,%MAP_OF_EXTTABLE_FMT,%MAP_OF_INDEX);
+my (@TABLE_PARTITIONS_ORDER_ARRAY,%MAP_OF_RELOPTION);
+my ($DATABASE_TABLESPACE,$DATABASE_VERSION);
+my ($FILE_HANDLE);
+my ($SQL_BATCH) = (300);
+my ($INDENT) = ("  ");
+my ($TAIL_ResourceQueue,$TAIL_ROLE,$TAIL_TableSpace,$TAIL_RoleSetting,$TAIL_Language,$TAIL_Schema,$TAIL_Type,$TAIL_Function,
+    $TAIL_Sequence,$TAIL_Table,$TAIL_ExtTable,$TAIL_View,$TAIL_Index,$TAIL_DefPri,$TAIL_Comment) =
+    ("ResourceQueue","Role","TableSpace","RoleSetting","Language","Schema","Type","Function","Sequence","Table","ExtTable","View","Index","DefPri","Comment");
+my %RELATION_ACL_MAP = ("r" => "SELECT","w" => "UPDATE","a" => "INSERT","d" => "DELETE","x" => "REFERENCES","t" => "TRIGGER","D" => "TRUNCATE");
+my %SEQUENCE_ACL_MAP = ("U" => "USAGE","r" => "SELECT","w" => "UPDATE");
+my %EXT_FORMAT_TYPE_MAP = ("a" => "AVRO","b" => "CUSTOM","c" => "CSV","p" => "PARQUET","t" => "TEXT");
+my %KEY_WORD_SET;
+(my $CMD_NAME = $0) =~ s!.*/(.*)!$1!;
+
+my ($CMD_SPLIT,$SQL_DELIM,$RECORD_SPLIT) = (chr(1).chr(0).chr(2).chr(7),chr(3).chr(4).chr(8),chr(5).chr(6).chr(9).chr(10));
+my $REGION_START  = qq#--REGION-START-#.$CMD_SPLIT;
+my $REGION_END    = qq#--REGION-END---#.$CMD_SPLIT;
+my $TASK_SPLIT    = qq#--TASK---SPLIT-#.$CMD_SPLIT;
+
+my $SQL_GET_KEY_WORD = q#SELECT upper(word) FROM pg_get_keywords() WHERE catcode <> 'U';#;
+my $ENCODE_FUNCTION_ARG_CHECK_SQL = qq{SELECT args,prosrc FROM(
+    SELECT string_agg(t.typname,',' ORDER BY x.idx) args,md5(prosrc) prosrc FROM (
+    SELECT oid,proname, proargtypes typs, generate_series(0,array_upper(proargtypes,1)) idx,prosrc FROM pg_proc
+        WHERE proname = 'mcencode' AND pronamespace IN (SELECT oid FROM pg_namespace WHERE nspname LIKE 'gp_toolkit')
+    ) x, pg_type t WHERE t.oid = x.typs[x.idx] GROUP BY x.oid,x.proname,x.prosrc
+) y ORDER BY ascii(args) + length(args);};
+my @ENCODE_FUNCTION_ARG_CHECK_VALUE = ("_text","_aclitem","name","text");
+my @ENCODE_FUNCTION_SRC_CHECK_MD5 = ("cac17fe8e01235f96a4805ccc268443d","1e5a15807e4243c2bdad3c6aff6389f1","75245db7e5549d576526e1b10dfe87ad","75245db7e5549d576526e1b10dfe87ad");
+my $ENCODE_FUNCTION_DDL = q#CREATE OR REPLACE FUNCTION gp_toolkit.mcencode(str text) returns varchar as $$
+import base64
+if str == None:
+    return ""
+return base64.b64encode(str).replace("\n","")
+$$ language plpythonu;
+
+CREATE OR REPLACE FUNCTION gp_toolkit.mcencode(strs text[]) returns varchar as $$
+import base64
+if strs == None:
+    return ""
+output = []
+for str in strs:
+    output.append(base64.b64encode(str))
+return ",".join(output).replace("\n","")
+$$ language plpythonu;
+
+CREATE OR REPLACE FUNCTION gp_toolkit.mcencode(str name) returns varchar as $$
+import base64
+if str == None:
+    return ""
+return base64.b64encode(str).replace("\n","")
+$$ language plpythonu;
+
+CREATE OR REPLACE FUNCTION gp_toolkit.mcencode(acls aclitem[]) returns varchar as $$
+import base64
+if acls == None:
+    return ""
+output = []
+for acl in acls:
+    (key,val,findKey,inBracket) = ("","",False,False)
+    for chr in acl:
+        if not findKey:
+            key = key + chr
+        else:
+            val = val + chr
+        if chr == '"':
+            inBracket = not inBracket
+        elif chr == '=' and not inBracket:
+            key = key[0:-1]
+            findKey = True
+    if inBracket:
+        plpy.error("Can not split: %s" % (acl))
+    output.append(base64.b64encode(key)+":"+base64.b64encode(val))
+return ",".join(output).replace("\n","")
+$$ language plpythonu;
+#;
+
+my $SQL_GET_RESOURCE_QUEUE = q#SELECT oid,gp_toolkit.mcencode(rsqname),
+    unnest(array['ACTIVE_STATEMENTS','MAX_COST','COST_OVERCOMMIT','MIN_COST']) resname,
+    unnest(array[rsqcountlimit::varchar,rsqcostlimit::varchar,decode(rsqovercommit,true,'TRUE','FALSE')::varchar,rsqignorecostlimit::varchar]) ressetting,
+    unnest(array[1,2,4,3]) restypid
+FROM pg_resqueue
+    UNION
+SELECT rq.oid,gp_toolkit.mcencode(rq.rsqname),
+    upper(rt.resname),upper(rc.ressetting),rt.restypid
+FROM pg_resqueue rq,pg_resourcetype rt,pg_resqueuecapability rc
+WHERE rq.oid = rc.resqueueid AND rc.restypid = rt.restypid
+ORDER BY 1,4;#;
+my $SQL_GET_RESOURCE_GROUP = q#SELECT r.oid,gp_toolkit.mcencode(rsgname),
+    (array['CONCURRENCY','CPU_RATE_LIMIT','MEMORY_LIMIT','MEMORY_SHARED_QUOTA','MEMORY_SPILL_RATIO','MEMORY_AUDITOR','CPUSET'])[reslimittype],value
+FROM pg_resgroup r,pg_resgroupcapability c
+WHERE c.resgroupid = r.oid ORDER BY r.oid,c.reslimittype;#;
+my $SQL_GET_ROLE = qq#SELECT oid,gp_toolkit.mcencode(rolname),rolsuper,rolinherit,rolcreaterole,rolcreatedb,rolcatupdate,
+    rolcanlogin,rolconnlimit,rolpassword,rolvaliduntil,gp_toolkit.mcencode(rolconfig),'' setdatabase,
+    rolresqueue,rolcreaterextgpfd,rolcreaterexthttp,rolcreatewextgpfd,
+    rolcreaterexthdfs,rolcreatewexthdfs,null rolresgroup
+FROM pg_authid
+UNION ALL
+SELECT null,null,null,null,null,null,null,null,null,null,null,gp_toolkit.mcencode(datconfig),gp_toolkit.mcencode(datname),
+    null,null,null,null,null,null,null
+FROM pg_database WHERE datconfig IS NOT NULL;#;
+my $SQL_GET_ROLE_V5 = qq#SELECT oid,gp_toolkit.mcencode(rolname),rolsuper,rolinherit,rolcreaterole,rolcreatedb,rolcatupdate,
+    rolcanlogin,rolconnlimit,rolpassword,rolvaliduntil,gp_toolkit.mcencode(rolconfig),'' setdatabase,
+    rolresqueue,rolcreaterextgpfd,rolcreaterexthttp,rolcreatewextgpfd,
+    rolcreaterexthdfs,rolcreatewexthdfs,rolresgroup
+FROM pg_authid
+UNION ALL
+SELECT null,null,null,null,null,null,null,null,null,null,null,gp_toolkit.mcencode(datconfig),gp_toolkit.mcencode(datname),
+    null,null,null,null,null,null,null
+FROM pg_database WHERE datconfig IS NOT NULL;#;
+my $SQL_GET_ROLE_V6 = qq#SELECT a.oid,gp_toolkit.mcencode(rolname),rolsuper,rolinherit,rolcreaterole,rolcreatedb,rolcatupdate,
+    rolcanlogin,rolconnlimit,rolpassword,rolvaliduntil,gp_toolkit.mcencode(setconfig),gp_toolkit.mcencode(d.datname) setdatabase,
+    rolresqueue,rolcreaterextgpfd,rolcreaterexthttp,rolcreatewextgpfd,
+    false rolcreaterexthdfs,false rolcreatewexthdfs,rolresgroup
+FROM pg_authid a FULL JOIN pg_db_role_setting s ON a.oid = s.setrole LEFT JOIN pg_database d ON s.setdatabase = d.oid;#;
+my $SQL_GET_EXTPROTOCOL = qq{SELECT ptcname,unnest(string_to_array(gp_toolkit.mcencode(ptcacl),',')) from pg_extprotocol;};
+my $SQL_GET_TABLESPACE = q#SELECT ts.oid,gp_toolkit.mcencode(spcname),
+    ts.spcowner,
+    gp_toolkit.mcencode(fsname),gp_toolkit.mcencode(spcacl)
+FROM pg_tablespace ts,pg_filespace fs
+WHERE ts.spcfsoid = fs.oid AND spcname not in('pg_global');#;
+my $SQL_GET_TABLESPACE_V6 = q#SELECT ts.oid,gp_toolkit.mcencode(spcname),
+    ts.spcowner,
+    gp_toolkit.mcencode(CASE WHEN ts.oid < 16384 THEN NULL ELSE (
+        SELECT '''' || pg_tablespace_location(ts.oid) || ''' WITH(' || (
+            SELECT string_agg('content' || gp_segment_id || '=''' || tblspc_loc, E''', ' ORDER BY gp_segment_id)
+            FROM pg_catalog.gp_tablespace_location(ts.oid)
+            WHERE gp_segment_id >= 0) || ''')'
+    ) END) AS spclocation,
+    gp_toolkit.mcencode(spcacl)
+FROM pg_tablespace ts
+WHERE spcname not in('pg_global');#;
+my $SQL_GET_AUTH_MEMBER = q#SELECT roleid,member,grantor,admin_option FROM pg_auth_members;#;
+my $SQL_GET_SCHEMA = qq#SELECT oid,gp_toolkit.mcencode(nspname),
+    nspowner,
+    gp_toolkit.mcencode(nspacl)
+FROM pg_namespace;#;
+my $SQL_GET_LANGUAGE = qq#SELECT oid,lanname,lanispl,lanpltrusted,lanplcallfoid,lanvalidator,
+    gp_toolkit.mcencode(lanacl)
+FROM pg_language;#;
+my $SQL_GET_TYPE = q#SELECT oid,gp_toolkit.mcencode(typname),typnamespace FROM pg_type;#;
+my $SQL_GET_ATTRIBUTE = q{SELECT attrelid,gp_toolkit.mcencode(attname),
+    gp_toolkit.mcencode(format_type(atttypid,atttypmod)),attnum,attnotnull,atthasdef,attisdropped
+FROM pg_attribute
+WHERE attrelid >= 16384 AND attnum > 0 AND NOT EXISTS(SELECT 1 FROM pg_partition_rule WHERE parchildrelid = attrelid);};
+my $SQL_GET_ATTRDEF = qq{SELECT adrelid,adnum,gp_toolkit.mcencode(pg_get_expr(adbin,adrelid)) FROM pg_attrdef
+WHERE NOT EXISTS(SELECT 1 FROM pg_partition_rule WHERE parchildrelid = adrelid);};
+my $SQL_GET_DISTRIBUTION = q{SELECT localoid,array_to_string(attrnums,','),'p' AS policytype FROM gp_distribution_policy WHERE NOT EXISTS(SELECT 1 FROM pg_partition_rule WHERE parchildrelid = localoid);};
+my $SQL_GET_DISTRIBUTION_V6 = q{SELECT localoid,array_to_string(distkey,','),policytype FROM gp_distribution_policy WHERE NOT EXISTS(SELECT 1 FROM pg_partition_rule WHERE parchildrelid = localoid);};
+my $SQL_GET_COMPTYPE = q#SELECT oid,gp_toolkit.mcencode(relname),relnamespace,relowner,relnatts FROM pg_class WHERE relkind = 'c' and reltype >= 16384;#;
+my $SQL_GET_ENUM = q#SELECT gp_toolkit.mcencode(typname),typnamespace,typowner,string_agg(gp_toolkit.mcencode(enumlabel),',' ORDER BY e.oid)
+FROM pg_type t,pg_enum e
+WHERE e.enumtypid = t.oid AND typtype ='e' AND t.oid >= 16384
+GROUP BY 1,2,3;#;
+my $SQL_GET_DOMAIN = q#SELECT gp_toolkit.mcencode(d.typname),d.typnamespace,
+gp_toolkit.mcencode(t.typname),t.typnamespace,d.typowner
+FROM pg_type d,pg_type t
+WHERE d.typbasetype = t.oid AND d.typtype = 'd' AND d.oid >= 16384;#;
+my $SQL_GET_AGG = qq#SELECT pr.oid AS aggfnoid,aggtransfn,aggprelimfn,aggfinalfn,
+    format_type(ag.aggtranstype, NULL) aggtranstype,agginitval
+    FROM pg_aggregate ag
+    JOIN pg_proc pr ON pr.oid = ag.aggfnoid
+    LEFT OUTER JOIN pg_namespace opn ON opn.oid = pr.pronamespace 
+    WHERE (pronamespace = 2200 OR pronamespace >= 16384);#;
+my $SQL_GET_AGG_V6 = qq#SELECT pr.oid AS aggfnoid,aggtransfn,aggcombinefn,aggfinalfn,
+    format_type(ag.aggtranstype, NULL) aggtranstype,agginitval
+    FROM pg_aggregate ag
+    JOIN pg_proc pr ON pr.oid = ag.aggfnoid
+    LEFT OUTER JOIN pg_namespace opn ON opn.oid = pr.pronamespace 
+    WHERE (pronamespace = 2200 OR pronamespace >= 16384);#;
+my $SQL_GET_FUNCTION = qq#SELECT oid,gp_toolkit.mcencode(proname),pronamespace,proowner,prolang,proisagg,prosecdef,proisstrict,proretset,provolatile,pronargs,prorettype,
+    array_to_string(proargtypes,','),array_to_string(proallargtypes,','),array_to_string(proargmodes,','),gp_toolkit.mcencode(proargnames),
+    gp_toolkit.mcencode(prosrc),probin,gp_toolkit.mcencode(proacl),'','',''
+FROM pg_proc
+WHERE pronamespace >=16384 or pronamespace = 2200;#;
+my $SQL_GET_FUNCTION_V5 = qq#SELECT oid,gp_toolkit.mcencode(proname),pronamespace,proowner,prolang,proisagg,prosecdef,proisstrict,proretset,provolatile,pronargs,prorettype,
+    array_to_string(proargtypes,','),array_to_string(proallargtypes,','),array_to_string(proargmodes,','),gp_toolkit.mcencode(proargnames),
+    gp_toolkit.mcencode(prosrc),probin,gp_toolkit.mcencode(proacl),procost,prorows,gp_toolkit.mcencode(proconfig)
+FROM pg_proc
+WHERE pronamespace >=16384 or pronamespace = 2200;#;
+
+my $SQL_GET_FUNCTION_ARGDEF = qq#SELECT oid,pronargs,gp_toolkit.mcencode(pg_get_expr(proargdefaults,'pg_catalog.pg_class'::regclass)),pronargdefaults
+FROM pg_proc
+WHERE pronamespace >=16384 or pronamespace = 2200 AND pronargdefaults > 0;
+#;
+my $SQL_GET_SEQUENCE = qq{SELECT c.oid,c.relnamespace,c.relowner,gp_toolkit.mcencode(relname),
+    gp_toolkit.mcencode(c.relacl)
+FROM pg_class c,pg_namespace n
+WHERE c.relnamespace = n.oid AND relkind='S' AND (n.oid >= 16384 OR n.oid = 2200);};
+my $SQL_GET_DATABASE_TABLESPACE = qq{SELECT gp_toolkit.mcencode(datname),dattablespace FROM pg_database;};
+my $SQL_GET_PARTITION = q{SELECT oid,parrelid,parkind,parlevel,paristemplate,array_to_string(paratts,',') FROM pg_partition order by 2,4;};
+my $SQL_GET_PARTITION_RULE = qq{SELECT oid,paroid,parchildrelid,parparentrule,gp_toolkit.mcencode(parname),parisdefault,parruleord,parrangestartincl,parrangeendincl,
+    gp_toolkit.mcencode(pg_get_expr(parrangestart, parchildrelid)),gp_toolkit.mcencode(pg_get_expr(parrangeend, parchildrelid)),
+    gp_toolkit.mcencode(pg_get_partition_rule_def(oid, true))
+FROM pg_partition_rule ORDER BY 2,4,7;};
+my $SQL_GET_TABLE_CHECK = q{SELECT conrelid,gp_toolkit.mcencode(conname),gp_toolkit.mcencode(pg_get_constraintdef(oid)) AS consrc
+FROM pg_constraint
+WHERE contype = 'c' AND NOT EXISTS(SELECT 1 FROM pg_partition_rule WHERE parchildrelid = conrelid) ORDER BY 1,2;};
+my $SQL_GET_TABLE = qq{SELECT oid,gp_toolkit.mcencode(relname),relnamespace,relowner,reltablespace,relnatts,
+    relhasoids,relhassubclass,gp_toolkit.mcencode(relacl),array_to_string(reloptions,','),false as unlogged,relkind
+FROM pg_class WHERE (relnamespace >= 16384 OR relnamespace = 2200) AND relkind = 'r' AND relstorage <> 'x';};
+my $SQL_GET_TABLE_V6 = qq{SELECT oid,gp_toolkit.mcencode(relname),relnamespace,relowner,reltablespace,relnatts,
+    relhasoids,relhassubclass,gp_toolkit.mcencode(relacl),array_to_string(reloptions,','),relpersistence = 'u' as unlogged,relkind
+FROM pg_class WHERE (relnamespace >= 16384 OR relnamespace = 2200) AND relkind IN ('m','r') AND relstorage <> 'x';};
+my $SQL_GET_PARTITION_ORDER = qq{SELECT parrelid FROM pg_partition p, pg_partition_rule r WHERE p.oid = r.paroid GROUP BY 1 ORDER BY count(*) DESC;};
+my $SQL_GET_VIEW_DEPEND = q{SELECT v.oid void,t.oid toid,t.relkind kind
+FROM pg_class v,pg_namespace nv,pg_depend dv,pg_class t,pg_namespace nt,pg_depend dt
+WHERE dv.objid = dt.objid AND dv.refobjid <> dt.refobjid
+    AND v.oid = dv.refobjid AND v.relnamespace = nv.oid AND (nv.oid >= 16384 OR nv.nspname = 'public') AND dv.refclassid = 1259
+    AND t.oid = dt.refobjid AND t.relnamespace = nt.oid AND (nt.oid >= 16384 OR nt.nspname = 'public') AND dt.refclassid = 1259
+    AND v.relkind IN ('m','v') AND t.relkind <> 'r' AND dv.deptype = 'i' AND nv.nspname NOT LIKE E'pg\_temp\_%' AND nv.nspname NOT LIKE E'pg\_toast\_temp\_%'
+    GROUP BY 1,2,3;};
+my $SQL_GET_EXTTABLE_FMT_V4 = qq{SELECT reloid,gp_toolkit.mcencode(location),fmttype,gp_toolkit.mcencode(fmtopts),
+gp_toolkit.mcencode(command),rejectlimit,rejectlimittype,fmterrtbl,pg_encoding_to_char(encoding),writable,'' AS logerrors
+FROM pg_exttable;};
+my $SQL_GET_EXTTABLE_FMT_V5 = qq{SELECT reloid,gp_toolkit.mcencode(coalesce(urilocation,execlocation)),fmttype,gp_toolkit.mcencode(fmtopts),
+gp_toolkit.mcencode(command),rejectlimit,rejectlimittype,fmterrtbl,pg_encoding_to_char(encoding),writable,'' AS logerrors
+FROM pg_exttable;};
+my $SQL_GET_EXTTABLE_FMT_V6 = qq{SELECT reloid,gp_toolkit.mcencode(coalesce(urilocation,execlocation)),fmttype,gp_toolkit.mcencode(fmtopts),
+gp_toolkit.mcencode(command),rejectlimit,rejectlimittype,'' AS fmterrtbl,pg_encoding_to_char(encoding),writable,logerrors
+FROM pg_exttable;};
+
+my $SQL_GET_EXTTABLE = qq{SELECT oid,gp_toolkit.mcencode(relname),relnamespace,relowner,relnatts,
+    gp_toolkit.mcencode(relacl)
+FROM pg_class
+WHERE relstorage = 'x' AND (relnamespace >= 16384 OR relnamespace = 2200);};
+
+my $SQL_GET_VIEW = qq{SELECT c.relnamespace,c.reltablespace,c.relkind,c.oid,c.relowner,gp_toolkit.mcencode(relacl),array_to_string(c.reloptions,','),
+    gp_toolkit.mcencode(c.relname),
+    gp_toolkit.mcencode(pg_get_viewdef(c.oid))
+FROM pg_class c,pg_namespace n
+WHERE c.relnamespace = n.oid AND c.relkind IN('m','v') AND (n.oid >= 16384 OR n.nspname='public') AND n.nspname NOT LIKE E'pg\_temp\_%' AND n.nspname NOT LIKE E'pg\_toast\_temp\_%';};
+
+my $SQL_GET_INDEX = q{SELECT indrelid,gp_toolkit.mcencode(ci.relname),indisprimary,c.relnamespace,gp_toolkit.mcencode(pg_get_indexdef(indexrelid))
+FROM pg_index i,pg_class c,pg_class ci,pg_namespace n
+WHERE i.indrelid = c.oid AND i.indexrelid = ci.oid AND c.relnamespace = n.oid
+AND c.oid >= 16384 AND (n.oid >= 16384 OR n.nspname='public') AND n.nspname NOT LIKE E'pg\_temp\_%' AND n.nspname NOT LIKE E'pg\_toast\_temp\_%';};
+
+my $SQL_GET_DEF_PRI = qq#SELECT defaclrole,defaclnamespace,defaclobjtype,gp_toolkit.mcencode(defaclacl) FROM pg_default_acl;#;
+
+my $SQL_GET_COMMENT = q{SELECT objoid,classoid,objsubid,gp_toolkit.mcencode(description) FROM pg_description
+    WHERE objoid >= 16384 AND NOT EXISTS(SELECT 1 FROM pg_partition_rule WHERE parchildrelid = objoid);};
+
+my $HELP_MESSAGE = qq#COMMAND NAME: $CMD_NAME
+Developed by Miao Chen
+
+Work Email:
+michen\@pivotal.io
+Private Email:
+miaochen\@mail.ustc.edu.cn
+************************************************************************************************
+SYNOPSIS
+************************************************************************************************
+$CMD_NAME [--database database]
+  [--port port]
+  [-s <schema> [-s <schema>] ...]
+  [-S <schema> [-S <schema>] ...]
+  [-f filename]
+  [--target-version gpversion]
+  [--reloption filename]
+  [-h|--help]
+  [--version]
+
+If you want use psql to execute the backup file, you can use this command to process the backup file:
+
+Ascii0=`echo -n 'print chr(0);'|perl`;sed -e /^--.*\$Ascii0/d -i \$backup_file_name
+
+*****************************************************
+OPTIONS
+*****************************************************
+
+--database <Database name>
+
+  Backup ddl from this database.
+  If not specified, use \$PGDATABSE
+
+--port <master port>
+
+  Database port number, If not specified, use \$PGPORT or the default is 5432.
+  eg.
+  --port 5433
+
+-s <schema name>
+
+  Backup tables in this schema.
+  This option can be specified multiple times to include multiple schemas.
+  eg.:
+  -s public -s myschema
+
+-S <schema name>
+
+  Do not backup tables in this schema.
+  This option can be specified multiple times to include multiple schemas.
+  eg.:
+  -S public -S myschema
+
+-f <filename>
+
+  Output ddl to this file.
+
+--target-version
+
+  Backup ddl for this greenplum version, the default is 5.
+  For greenplum version 5, external table have not error table.
+  eg.:
+  --target-version 5
+
+--reloption <filename>
+
+  Use a file to specify table's reloptions.
+  For example, if you need modify some table's reloptions when migrate to other cluster.
+  Such as, old cluster use too many column table, for many small table,
+  you can use this parameter to specify the reloptions when backup ddls, like:
+  public.smalltable1 => appendonly=true,compresstype=zlib,compresslevel=5,orientation=row
+  public.smalltable2 => appendonly=true,compresstype=zlib,compresslevel=5,orientation=row
+
+-h|--help
+
+  Displays the online help.
+
+--version
+
+  Displays the command version.
+
+example:
+$CMD_NAME --database postgres --port 5432 -f postgres.ddl
+$CMD_NAME -h | --help
+#;
+
+sub printMessage{
+    my ($flag,$message) = @_;
+    my $time_flag = strftime("%Y%m%d:%H:%M:%S.",localtime);
+    $message = "$time_flag-[$flag]-:$message\n";
+    if("ERROR" eq $flag){
+        print STDERR $message;
+    }else{
+        print STDOUT $message;
+    }
+}
+sub exitMain{
+    my ($code) = @_;
+    exit $code;
+}
+sub errorMessage{
+    my ($message) = @_;
+    printMessage("ERROR",$message);
+    print "Usage: $CMD_NAME [-h|--help] [options]\n";
+    exitMain(1);
+}
+sub trim{
+    my ($string) = @_;
+    $string =~ s/(^\s+|\s+$)//g;
+    return $string;
+}
+sub output{
+    if($FILE_HANDLE){
+        print $FILE_HANDLE trim($_[0])."\n";
+    }else{
+        print trim($_[0])."\n";
+    }
+}
+sub outwarn{
+    print STDERR trim($_[0])."\n";
+}
+sub readLineFromFile{
+    my ($file_path) = @_;
+    if(!-e $file_path){
+        errorMessage("No file exists named: $file_path");
+    }
+    if(!open(FILE,"<",$file_path)){
+        errorMessage("Can't open file: $file_path");
+    }
+    my @line_list = ();
+    while(my $line = <FILE>){
+        $line = trim($line);
+        if(!($line =~ /^#/) && $line ne ""){
+            push @line_list,$line;
+        }
+    }
+    close FILE;
+    return @line_list;
+}
+sub outputTask{
+    my ($task,$indexref,$taskTail) = @_;
+    if($$indexref == 0){
+        output($REGION_START.$taskTail);
+    }else{
+        output($TASK_SPLIT.$taskTail);
+    }
+    output($task);
+    $$indexref += 1;
+}
+sub outputRegionEnd{
+    my ($indexref,$taskTail) = @_;
+    if($$indexref > 0){
+        output($REGION_END.$taskTail);
+    }
+}
+sub encode{
+    my ($string) = @_;
+    my $encode = encode_base64($string);
+    $encode =~ s/\n//g;
+    return $encode;
+}
+sub decode{
+    if(wantarray()){
+        my @rv = ();
+        for my $str(@_){
+            push @rv,decode_base64($str);
+        }
+        return @rv;
+    }else{
+        return decode_base64($_[0]);
+    }
+}
+sub quote{
+    my ($ident) = @_;
+    if($ident eq ""){
+        return "";
+    }
+    $ident =~ s/"/""/g;
+    if($ident !~ /^[a-z_][a-z0-9_]*$/ || exists $KEY_WORD_SET{uc($ident)}){
+        $ident = '"'.$ident.'"';
+    }
+    return $ident;
+}
+sub isTempSchema{
+    if($_[0] =~ /^pg_temp_/ || $_[0] =~ /^pg_toast_temp_/){
+        return 1;
+    }
+    return 0;
+}
+sub queryResult{
+    my ($query_sql,$return_flag) = @_;
+    my $CMDS = "PGDATABASE=$DATABASE_NAME PGPORT=$PORT PGOPTIONS='-c optimizer=off -c client_encoding=UTF8' ";
+    local $/ = $RECORD_SPLIT;
+    $CMDS = $CMDS."psql -R '$/' -tAXF '$SQL_DELIM' -v ON_ERROR_STOP=1 2>&1 <<'END_OF_SQL'\n";
+    $CMDS = $CMDS.$query_sql."\n";
+    $CMDS = $CMDS."END_OF_SQL\n";
+    my @result = readpipe($CMDS);
+    my $return_code = $? >> 8;
+    chomp(@result);
+    local $/ = chr(10);
+    chomp($result[-1]) if (@result > 0);
+    return ($return_code,join("\n",@result)) if ("CV" eq $return_flag);
+    errorMessage(join("\n",@result)) if ($return_code);
+    return join("\n",@result) if ("Scalar" eq $return_flag);
+    my @return_list = ();
+    for my $row(@result){
+        push @return_list,[split(/$SQL_DELIM/,$row)];
+    }
+    return @return_list;
+}
+sub getOption{
+    GetOptions(
+        'database:s'       => \$DATABASE_NAME,
+        'port:i'           => \$PORT,
+        's:s'              => \@SCHEMA_ARRAY,
+        'S:s'              => \@EX_SCHEMA_ARRAY,
+        'f:s'              => \$TO_FILE,
+        'target-version:i' => \$TARGET_VERSION,
+        'reloption:s'      => \$RELOPTION_FILE,
+        'h|help!'          => \$IS_HELP,
+        'version!'         => \$VERSION,
+    );
+    if(@ARGV != 0){
+        errorMessage("Some parameters unknown: [@ARGV]\nPlease refer to $CMD_NAME --help");
+    }
+    if($IS_HELP){
+        print $HELP_MESSAGE;
+        exitMain(0);
+    }
+    if($VERSION){
+        print "$CMD_NAME 1.0\n";
+        exitMain(0);
+    }
+}
+sub checkOption{
+    if("" eq $DATABASE_NAME){
+        $DATABASE_NAME = trim($ENV{'PGDATABASE'});
+    }
+    if("" eq $DATABASE_NAME){
+        errorMessage("Please specify parameter: --database");
+    }
+    if("" eq $PORT){
+        $PORT = trim($ENV{'PGPORT'});
+    }
+    if("" eq $PORT){
+        errorMessage("Please specify parameter: --port");
+    }
+    if("" ne $TO_FILE){
+        if(!open($FILE_HANDLE,">",$TO_FILE)){
+            errorMessage("Can't open file: $TO_FILE");
+        }
+        $FILE_HANDLE->autoflush(1);
+    }
+    if(@SCHEMA_ARRAY > 0 || @EX_SCHEMA_ARRAY > 0){
+        for my $schema(@EX_SCHEMA_ARRAY){
+            $SET_OF_EXCLUDE_SCHEMA{trim($schema)} = "";
+        }
+        for my $schema(@SCHEMA_ARRAY){
+            if(!exists $SET_OF_EXCLUDE_SCHEMA{trim($schema)}){
+                $SET_OF_INCLUDE_SCHEMA{trim($schema)} = "";
+            }
+        }
+        $INCLUDE_SCHEMA_SIZE = keys %SET_OF_INCLUDE_SCHEMA;
+    }
+    if(-e $RELOPTION_FILE){
+        my @reloption_array = readLineFromFile($RELOPTION_FILE);
+        for my $row(@reloption_array){
+            my ($tablename,$reloption) = split(/=>/,$row);
+            $MAP_OF_RELOPTION{trim($tablename)} = uc(trim($reloption));
+        }
+    }
+}
+sub skipThisSchema{
+    my ($schema) = @_;
+    if($INCLUDE_SCHEMA_SIZE > 0 && !exists $SET_OF_INCLUDE_SCHEMA{$schema}){
+        return 1;
+    }elsif(exists $SET_OF_EXCLUDE_SCHEMA{$schema}){
+        return 1;
+    }else{
+        return undef;
+    }
+}
+sub getVersion{
+    my $versionString = queryResult("SELECT version();","Scalar");
+    if($versionString =~ /Greenplum Database (\d)/){
+        $DATABASE_VERSION = int($1);
+        if($TARGET_VERSION eq ""){
+            $TARGET_VERSION = $DATABASE_VERSION;
+        }
+    }
+}
+sub getKeyWord{
+    my @result = queryResult($SQL_GET_KEY_WORD);
+    for my $row(@result){
+        my ($word) = @$row;
+        $KEY_WORD_SET{$word} = "";
+    }
+}
+sub checkLanguage{
+    my $result = queryResult("select 1 from pg_language where lanname='plpythonu';","Scalar");
+    if("" eq $result){
+        queryResult("create language plpythonu;");
+    }
+}
+sub checkEncodeFunction{
+    my @result = queryResult($ENCODE_FUNCTION_ARG_CHECK_SQL);
+    my $has_problem = 0;
+    my $result_size = @result;
+    my $check_size = @ENCODE_FUNCTION_ARG_CHECK_VALUE;
+    if($result_size != $check_size){
+        $has_problem = 1;
+    }else{
+        for my $index(0 .. $result_size - 1){
+            my ($arg,$md5) = @{$result[$index]};
+            if($arg ne $ENCODE_FUNCTION_ARG_CHECK_VALUE[$index] || $md5 ne $ENCODE_FUNCTION_SRC_CHECK_MD5[$index]){
+                $has_problem = 1;
+                last;
+            }
+        }
+    }
+    if($has_problem){
+        for my $row(@result){
+            my ($arg,$md5) = @$row;
+            queryResult("drop function if exists gp_toolkit.mcencode($arg);");
+        }
+        queryResult($ENCODE_FUNCTION_DDL);
+    }
+}
+sub outputResourceQueue{
+    my @result = queryResult($SQL_GET_RESOURCE_QUEUE);
+    my %name_map = ();
+    for my $row(@result){
+        my ($oid,$rsqname,$resname,$ressetting,$restypid) = @$row;
+        $rsqname = quote(decode($rsqname));
+        if("MEMORY_LIMIT" eq uc($resname)){
+            $ressetting = "'".$ressetting."'";
+        }
+        my @with_array;
+        if(exists $name_map{$rsqname}){
+            @with_array = @{$name_map{$rsqname}};
+        }else{
+            $MAP_OF_RESOURCE_QUEUE{$oid} = $rsqname;
+        }
+        push @with_array,qq{$resname=$ressetting};
+        $name_map{$rsqname} = [@with_array];
+    }
+    my $index = 0;
+    for my $rsqname(keys %name_map){
+        my $create_sql = qq{CREATE RESOURCE QUEUE $rsqname WITH (}.join(',',@{$name_map{$rsqname}}).qq{);};
+        $create_sql = $create_sql."\n"."ALTER RESOURCE QUEUE $rsqname WITH (".join(',',@{$name_map{$rsqname}}).");";
+        outputTask($create_sql,\$index,$TAIL_ResourceQueue);
+    }
+    outputRegionEnd(\$index,$TAIL_ResourceQueue);
+}
+sub outputResourceGroup{
+    if($DATABASE_VERSION < 5){
+        return;
+    }
+    my @result = queryResult($SQL_GET_RESOURCE_GROUP);
+    my %name_map = ();
+    for my $row(@result){
+        my ($oid,$rsgname,$resname,$ressetting) = @$row;
+        $rsgname = quote(decode($rsgname));
+        if("MEMORY_AUDITOR" eq $resname){
+            $ressetting = $ressetting eq "1" ? "cgroup" : "vmtracker";
+        }elsif("-1" eq $ressetting){
+            next;
+        }elsif("CPUSET" eq $resname){
+            $ressetting = "'".$ressetting."'";
+        }
+        my @with_array;
+        if(exists $name_map{$rsgname}){
+            @with_array = @{$name_map{$rsgname}};
+        }else{
+            $MAP_OF_RESOURCE_GROUP{$oid} = $rsgname
+        }
+        push @with_array,([$resname,$ressetting]);
+        $name_map{$rsgname} = [@with_array];
+    }
+    my $index = 0;
+    for my $rsgname(keys %name_map){
+        my (@create_array,@alter_array);
+        for my $row(@{$name_map{$rsgname}}){
+            my ($resname,$ressetting) = @$row;
+            push @create_array,$resname."=".$ressetting;
+            if("MEMORY_AUDITOR" ne $resname){
+                push @alter_array,"ALTER RESOURCE GROUP $rsgname SET ".$resname." ".$ressetting.";";
+            }
+        }
+        my $group_sql = qq{CREATE RESOURCE GROUP $rsgname WITH (}.join(',',@create_array).qq{);}."\n".join("\n",@alter_array);
+        outputTask($group_sql,\$index,$TAIL_ResourceQueue);
+    }
+    outputRegionEnd(\$index,$TAIL_ResourceQueue);
+}
+sub outputRole{
+    my @result;
+    if($DATABASE_VERSION < 6){
+        @result = queryResult($SQL_GET_ROLE);
+    }else{
+        @result = queryResult($SQL_GET_ROLE_V6);
+    }
+    my $index = 0;
+    my %exists_hash;
+    for my $row(@result){
+        my ($oid,$rolname) = @$row;
+        if(!exists $exists_hash{$oid} && "" ne $rolname){
+            my $rolname = quote(decode($rolname));
+            outputTask(qq{CREATE ROLE $rolname;},\$index,$TAIL_ROLE);
+            $MAP_OF_ROLE{$oid} = $rolname;
+            $exists_hash{$oid} = "";
+        }
+    }
+    outputRegionEnd(\$index,$TAIL_ROLE);
+}
+sub outputTablespace{
+    my @result;
+    my $index = 0;
+    if($DATABASE_VERSION < 6){
+        @result = queryResult($SQL_GET_TABLESPACE);
+        for my $row(@result){
+            my ($oid,$spcname,$spcowner,$fsname,$spcacl) = @$row;
+            ($spcname,$fsname) = (quote(decode($spcname)),quote(decode($fsname)));
+            $spcowner = $MAP_OF_ROLE{$spcowner};
+            $MAP_OF_TABLESPACE{$oid} = $spcname;
+            if($spcname eq "pg_default"){
+                next;
+            }
+            outputTask(qq{CREATE TABLESPACE $spcname OWNER $spcowner FILESPACE $fsname;},\$index,$TAIL_TableSpace);
+            if("" ne $spcacl){
+                for my $option(split(/,/,$spcacl)){
+                    my ($role,$value) = split(/:/,$option,2);
+                    ($role,$value) = (decode($role),decode($value));
+                    $role = "PUBLIC" if "" eq $role;
+                    $value =~ s/\/.*$//;
+                    output("GRANT ALL ON TABLESPACE $spcname TO $role;");
+                }
+            }
+        }
+    }else{
+        @result = queryResult($SQL_GET_TABLESPACE_V6);
+        for my $row(@result){
+            my ($oid,$spcname,$spcowner,$spclocation,$spcacl) = @$row;
+            ($spcname,$spclocation) = (quote(decode($spcname)),decode($spclocation));
+            $spcowner = $MAP_OF_ROLE{$spcowner};
+            $MAP_OF_TABLESPACE{$oid} = $spcname;
+            if($spcname eq "pg_default"){
+                next;
+            }
+            outputTask(qq{CREATE TABLESPACE $spcname OWNER $spcowner LOCATION $spclocation;},\$index,$TAIL_TableSpace);
+            if("" ne $spcacl){
+                for my $option(split(/,/,$spcacl)){
+                    my ($role,$value) = split(/:/,$option,2);
+                    ($role,$value) = (decode($role),decode($value));
+                    $role = "PUBLIC" if "" eq $role;
+                    $value =~ s/\/.*$//;
+                    output("GRANT ALL ON TABLESPACE $spcname TO $role;");
+                }
+            }
+        }
+    }
+    outputRegionEnd(\$index,$TAIL_TableSpace);
+}
+sub outputRoleSetting{
+    my @result;
+    if($DATABASE_VERSION < 5){
+        @result = queryResult($SQL_GET_ROLE);
+    }elsif($DATABASE_VERSION < 6){
+        @result = queryResult($SQL_GET_ROLE_V5);
+    }else{
+        @result = queryResult($SQL_GET_ROLE_V6);
+    }
+    my $index = 0;
+    my %exists_hash;
+    for my $row(@result){
+        my ($oid,$rolname,$super,$inherit,$createrole,$createdb,$catupdate,$canlogin,$connlimit,$password,$validuntil,
+            $config,$setdatabase,$resqueue,$rextgpfd,$rexthttp,$wextgpfd,$rexthdfs,$wexthdfs,$resgroup) = @$row;
+        ($rolname,$setdatabase) = (quote(decode($rolname)),quote(decode($setdatabase)));
+        if(!exists $exists_hash{$oid} && "" ne $rolname){
+            $resqueue = $MAP_OF_RESOURCE_QUEUE{$resqueue};
+            my $alter = qq{ALTER ROLE $rolname WITH};
+            $alter = $alter.($super eq "t" ? " SUPERUSER" : " NOSUPERUSER");
+            $alter = $alter.($inherit eq "t" ? " INHERIT" : " NOINHERIT");
+            $alter = $alter.($createrole eq "t" ? " CREATEROLE" : " NOCREATEROLE");
+            $alter = $alter.($createdb eq "t" ? " CREATEDB" : " NOCREATEDB");
+            $alter = $alter.($canlogin eq "t" ? " LOGIN" : " NOLOGIN");
+            $alter = $alter.qq{ CONNECTION LIMIT $connlimit};
+            $alter = $alter.qq{ PASSWORD '$password'};
+            $alter = $alter.("" ne $validuntil ? " VALID UNTIL '$validuntil'" : "");
+            $alter = $alter.($rextgpfd eq "t" ? " CREATEEXTTABLE (protocol='gpfdist',type='readable')" : "");
+            $alter = $alter.($rexthttp eq "t" ? " CREATEEXTTABLE (protocol='http',type='readable')" : "");
+            $alter = $alter.($wextgpfd eq "t" ? " CREATEEXTTABLE (protocol='gpfdist',type='writable')" : "");
+            if($TARGET_VERSION < 5){
+                $alter = $alter.($rexthdfs eq "t" ? " CREATEEXTTABLE (protocol='gphdfs',type='readable')" : "");
+                $alter = $alter.($wexthdfs eq "t" ? " CREATEEXTTABLE (protocol='gphdfs',type='writable')" : "");
+            }
+            $alter = $alter.("$super $rextgpfd $rexthttp $wextgpfd $rexthdfs $wexthdfs" eq "f f f f f f" ? " NOCREATEEXTTABLE" : "");
+            outputTask($alter.";",\$index,$TAIL_RoleSetting);
+            output(qq{ALTER ROLE $rolname RESOURCE QUEUE $resqueue;}); 
+            if(exists $MAP_OF_RESOURCE_GROUP{$resgroup}){
+                output(qq{ALTER ROLE $rolname RESOURCE GROUP }.$MAP_OF_RESOURCE_GROUP{$resgroup}.qq{;}); 
+            }
+            $exists_hash{$oid} = "";
+        }
+        if("" ne $config){
+            my @config_list = decode(split(/,/,$config));
+            for my $option(@config_list){
+                my ($key,$value) = split(/=/,$option,2);
+                ($key,$value) = (trim($key),trim($value));
+                if($key ne "search_path" && $key ne "DateStyle"){
+                    $value = "'".$value."'";
+                }
+                if($rolname ne ""){
+                    outputTask("ALTER ROLE ".($rolname eq "" ? "ALL" : $rolname).($setdatabase eq "" ? "" : " IN DATABASE ".$setdatabase)." SET $key TO $value;",\$index,$TAIL_RoleSetting);
+                }else{
+                    outputTask("ALTER DATABASE ".$setdatabase." SET $key TO $value;",\$index,$TAIL_RoleSetting);
+                }
+            }
+        }
+    }
+    @result = queryResult($SQL_GET_AUTH_MEMBER);
+    for my $row(@result){
+        my ($role,$member,$grantor,$admin_option) = @$row;
+        ($role,$member,$grantor) = ($MAP_OF_ROLE{$role},$MAP_OF_ROLE{$member},$MAP_OF_ROLE{$grantor});
+        my $grant = qq{GRANT $role TO $member};
+        $grant = $grant.($admin_option eq "t" ? " WITH ADMIN OPTION" : "");
+        $grant = $grant.("" ne $grantor ? " GRANTED BY $grantor" : "");
+        outputTask($grant.";",\$index,$TAIL_RoleSetting);
+    }
+    my %auth_map = ("a" => "INSERT","r" => "SELECT","ar" => "ALL","ra" => "ALL");
+    my @result = queryResult($SQL_GET_EXTPROTOCOL);
+    for my $row(@result){
+        my ($ptcname,$ptcacl) = @$row;
+        my ($role,$value) = split(/:/,$ptcacl,2);
+        ($role,$value) = (decode($role),decode($value));
+        $value =~ s/\/.*$//;
+        outputTask("GRANT ".$auth_map{$value}." ON PROTOCOL ".$ptcname." TO ".$role.";",\$index,$TAIL_RoleSetting);
+    }
+    outputRegionEnd(\$index,$TAIL_RoleSetting);
+}
+sub outputLanguage{
+    my @result = queryResult($SQL_GET_LANGUAGE);
+    my $index = 0;
+    for my $row(@result){
+        my ($oid,$lanname,$lanispl,$lanpltrusted,$lanplcallfoid,$lanvalidator,$lanacl) = @$row;
+        if($oid >= 16384){
+            outputTask(qq{CREATE LANGUAGE $lanname;},\$index,$TAIL_Language);
+            if("" ne $lanacl){
+                for my $option(split(/,/,$lanacl)){
+                    my ($role,$value) = split(/:/,$option,2);
+                    ($role,$value) = (decode($role),decode($value));
+                    $role = "PUBLIC" if "" eq $role;
+                    $value =~ s/\/.*$//;
+                    output("GRANT USAGE ON LANGUAGE $lanname TO $role;");
+                }
+            }
+        }
+        $MAP_OF_LANGUAGE{$oid} = $lanname;
+    }
+    outputRegionEnd(\$index,$TAIL_Language);
+}
+sub outputSchema{
+    my %auth_map = ("U" => "USAGE","C" => "CREATE","UC" => "ALL","CU" => "ALL");
+    my @result = queryResult($SQL_GET_SCHEMA);
+    my $index = 0;
+    for my $row(@result){
+        my ($oid,$nspname,$nspowner,$nspacl) = @$row;
+        ($nspname) = (quote(decode($nspname)));
+        $MAP_OF_SCHEMA{$oid} = $nspname;
+        $nspowner = $MAP_OF_ROLE{$nspowner};
+        if(isTempSchema($nspname) || skipThisSchema($nspname)){
+            next;
+        }
+        if($oid >= 16384 || $oid == 2200){
+            if($oid >= 16384){
+                outputTask(qq{CREATE SCHEMA $nspname;},\$index,$TAIL_Schema);
+                if("" ne $nspowner){
+                    output(qq{ALTER SCHEMA $nspname OWNER TO $nspowner;});
+                }
+                if("" ne $nspacl){
+                    for my $option(split(/,/,$nspacl)){
+                        my ($role,$value) = split(/:/,$option,2);
+                        ($role,$value) = (decode($role),decode($value));
+                        $role = "PUBLIC" if "" eq $role;
+                        $value =~ s/\/.*$//;
+                        output("GRANT $auth_map{$value} ON SCHEMA $nspname TO $role;");
+                    }
+                }
+            }
+        }
+    }
+    outputRegionEnd(\$index,$TAIL_Schema);
+}
+sub getTypeInformation{
+    my @result = queryResult($SQL_GET_TYPE);
+    for my $row(@result){
+        my ($oid,$typname,$typnamespace) = @$row;
+        ($typname,$typnamespace) = (decode($typname),$MAP_OF_SCHEMA{$typnamespace});
+        if($typnamespace eq "pg_catalog" || $typnamespace eq "information_schema"){
+            $MAP_OF_TYPE{$oid} = $typname;
+        }else{
+            $MAP_OF_TYPE{$oid} = $typnamespace.".".$typname;
+        }
+    }
+}
+sub getAttributeInformation{
+    my @result = queryResult($SQL_GET_ATTRIBUTE);
+    for my $row(@result){
+        my ($attrelid,$attname,$atttype,$attnum,$attnotnull,$atthasdef,$attisdropped) = @$row;
+        ($attname,$atttype) = (quote(decode($attname)),decode($atttype));
+        my $key = $attrelid."-".$attnum;
+        $MAP_OF_ATTRIBUTE{$key} = [($attname,$atttype,$attnotnull,$atthasdef,$attisdropped)];
+    }
+    @result = queryResult($SQL_GET_ATTRDEF);
+    for my $row(@result){
+        my ($adrelid,$adnum,$adsrc) = @$row;
+        ($adsrc) = (decode($adsrc));
+        my $key = $adrelid."-".$adnum;
+        $MAP_OF_ATTRDEF{$key} = $adsrc;
+    }
+    if($DATABASE_VERSION < 6){
+        @result = queryResult($SQL_GET_DISTRIBUTION);
+    }else{
+        @result = queryResult($SQL_GET_DISTRIBUTION_V6);
+    }
+    for my $row(@result){
+        my ($localoid,$attrnums,$policytype) = @$row;
+        if("r" eq $policytype){
+            $MAP_OF_DISTRIBUTION{$localoid} = "DISTRIBUTED REPLICATED";
+            next;
+        }elsif("" eq $attrnums){
+            $MAP_OF_DISTRIBUTION{$localoid} = "DISTRIBUTED RANDOMLY";
+            next;
+        }
+        my $attenough = 1;
+        my @diskeys_array = ();
+        my %attnumhash = ();
+        if("" ne $attrnums){
+            for my $attr(split(/,/,$attrnums)){
+                my $key = $localoid."-".$attr;
+                if(!exists $MAP_OF_ATTRIBUTE{$key}){
+                    outwarn("Table with oid $localoid has no attribute with attnum $attr");
+                    $attenough = 0;last;
+                }
+                if(exists $attnumhash{$attr}){
+                    next;
+                }
+                my ($attname,$atttype,$attnotnull,$atthasdef,$attisdropped) = @{$MAP_OF_ATTRIBUTE{$key}};
+                push @diskeys_array,$attname;
+                $attnumhash{$attr} = "";
+            }
+        }
+        if($attenough){
+            $MAP_OF_DISTRIBUTION{$localoid} = "DISTRIBUTED BY(".join(",",@diskeys_array).")";
+        }
+    }
+}
+sub outputCompType{
+    my @result = queryResult($SQL_GET_COMPTYPE);
+    my $index = 0;
+    for my $row(@result){
+        my($oid,$relname,$relnamespace,$relowner,$relnatts) = @$row;
+        ($relname,$relnamespace,$relowner) = (quote(decode($relname)),$MAP_OF_SCHEMA{$relnamespace},$MAP_OF_ROLE{$relowner});
+        if(isTempSchema($relnamespace) || skipThisSchema($relnamespace)){
+            next;
+        }
+        my @attibute_array;
+        for my $relattindex(1 .. $relnatts){
+            my $key = $oid."-".$relattindex;
+            my ($attname,$atttype,$attnotnull,$atthasdef,$attisdropped) = @{$MAP_OF_ATTRIBUTE{$key}};
+            if("t" eq $attisdropped){
+                next;
+            }
+            my $attr_sql = $attname."    ".$atttype;
+            push @attibute_array,$attr_sql;
+        }
+        my $create = qq{CREATE TYPE $relnamespace.$relname AS (\n};
+        $create = $create.join(",\n",@attibute_array);
+        $create = $create."\n);\n";
+        $create = $create."ALTER TYPE $relnamespace.$relname OWNER TO $relowner;";
+        outputTask($create,\$index,$TAIL_Type);
+    }
+    outputRegionEnd(\$index,$TAIL_Type);
+}
+sub outputEnum{
+    if($DATABASE_VERSION < 5){
+        return;
+    }
+    my @result = queryResult($SQL_GET_ENUM);
+    my $index = 0;
+    for my $row(@result){
+        my ($typname,$typnamespace,$typowner,$enumlabel) = @$row;
+        ($typname,$typnamespace,$typowner) = (quote(decode($typname)),$MAP_OF_SCHEMA{$typnamespace},$MAP_OF_ROLE{$typowner});
+        if(isTempSchema($typnamespace) || skipThisSchema($typnamespace)){
+            next;
+        }
+        my $create = qq{CREATE TYPE $typnamespace.$typname AS ENUM (\n};
+        my @label_array;
+        for my $label(split(/,/,$enumlabel)){
+            $label = decode($label);
+            $label =~ s/'/''/g;
+            push @label_array, "'".$label."'";
+        }
+        $create = $create.join(",\n",@label_array)."\n);\n";
+        $create = $create."ALTER TYPE $typnamespace.$typname OWNER TO $typowner;";
+        outputTask($create,\$index,$TAIL_Type);
+    }
+    outputRegionEnd(\$index,$TAIL_Type);
+}
+sub outputDomain{
+    my @result = queryResult($SQL_GET_DOMAIN);
+    my $index = 0;
+    for my $row(@result){
+        my ($domname,$domnamespace,$typname,$typnamespace,$domowner) = @$row;
+        ($domname,$domnamespace,$typname,$typnamespace,$domowner) = (quote(decode($domname)),$MAP_OF_SCHEMA{$domnamespace},quote(decode($typname)),$MAP_OF_SCHEMA{$typnamespace},$MAP_OF_ROLE{$domowner});
+        if(isTempSchema($domnamespace) || skipThisSchema($domnamespace)){
+            next;
+        }
+        my $create = qq{CREATE DOMAIN $domnamespace.$domname AS $typnamespace.$typname;\n};
+        $create = $create."ALTER DOMAIN $domnamespace.$domname OWNER TO $domowner;";
+        outputTask($create,\$index,$TAIL_Type);
+    }
+    outputRegionEnd(\$index,$TAIL_Type);
+}
+sub getArrayFromCommaSeparatedList{
+    my ($string) = @_;
+    if($string eq ""){
+        return ();
+    }
+    my @array = split(//,$string);
+    my @list = ();
+    my ($inSingleQuote,$inDoubleQuote,$bracketLevel) = (0,0,0);
+    my $item = "";
+    for my $curr(@array){
+        $item = $item.$curr;
+        if(!$inDoubleQuote && $curr eq "'"){
+            $inSingleQuote = !$inSingleQuote;
+        }elsif(!$inSingleQuote && $curr eq '"'){
+            $inDoubleQuote = !$inDoubleQuote;
+        }elsif(!$inDoubleQuote && !$inSingleQuote && $curr eq '('){
+            $bracketLevel++;
+        }elsif (!$inDoubleQuote && !$inSingleQuote && $curr eq ')'){
+            $bracketLevel--;
+        }elsif (!$inDoubleQuote && !$inSingleQuote && $bracketLevel == 0 && $curr eq ','){
+            push @list,trim(substr($item,0,-1));
+            $item = "";
+        }
+    }
+    if($inDoubleQuote || $inSingleQuote || $bracketLevel != 0){
+        errorMessage("Can not split:\n".$string);
+    }
+    push @list,trim($item);
+    return @list;
+}
+sub getFunctionArgDef{
+    if($DATABASE_VERSION < 5 || $TARGET_VERSION < 5){
+        return;
+    }
+    my @result = queryResult($SQL_GET_FUNCTION_ARGDEF);
+    for my $row(@result){
+        my ($oid,$pronargs,$defvalues,$defnum) = @$row;
+        $defvalues = decode($defvalues);
+        my @def_array = getArrayFromCommaSeparatedList($defvalues);
+        my $def_index = $pronargs - $defnum;
+        for my $def(@def_array){
+            $MAP_OF_FUNCTION_ARGDEF{$oid."-".$def_index} = $def;
+            $def_index ++;
+        }
+    }
+}
+sub getAggInformation{
+    my @result;
+    if($DATABASE_VERSION < 6){
+        @result = queryResult($SQL_GET_AGG);
+    }else{
+        @result = queryResult($SQL_GET_AGG_V6);
+    }
+    for my $row(@result){
+        my ($oid,$sfunc,$prefunc,$finalfunc,$stype,$initcond) = @$row;
+        $MAP_OF_AGG{$oid} = [($sfunc,$prefunc,$finalfunc,$stype,$initcond)];
+    }
+}
+sub outputFunction{
+    my @result;
+    if($DATABASE_VERSION < 5){
+        @result = queryResult($SQL_GET_FUNCTION);
+    }else{
+        @result = queryResult($SQL_GET_FUNCTION_V5);
+    }
+    my %volatile = ("s" => "STABLE","i" => "IMMUTABLE","v" => "VOLATILE");
+    my $index = 0;
+    for my $row(@result){
+        my ($oid,$proname,$pronamespace,$proowner,$prolang,$proisagg,$prosecdef,$proisstrict,$proretset,$provolatile,$pronargs,$prorettype,
+            $proargtypes,$proallargtypes,$proargmodes,$proargnames,$prosrc,$probin,$proacl,$procost,$prorows,$proconfig) = @$row;
+        ($proname,$prosrc,$pronamespace) = (quote(decode($proname)),decode($prosrc),$MAP_OF_SCHEMA{$pronamespace});
+        if(isTempSchema($pronamespace) || skipThisSchema($pronamespace)){
+            next;
+        }
+        if($proisagg eq "t"){
+            next;
+        }
+        my $create = qq{CREATE OR REPLACE FUNCTION $pronamespace.$proname(};
+        my $arguments = "";
+        my $argstype = "";
+        my @returns_table = ();
+        if($proallargtypes ne "" || $proargtypes ne ""){
+            my @type_array = split(/,/,("" eq $proallargtypes ? $proargtypes : $proallargtypes));
+            my @mode_array = split(/,/,$proargmodes);
+            my @name_array = decode(split(/,/,$proargnames));
+            my @argument_array = ();
+            my @argstype_array = ();
+            for my $index(0 .. @type_array - 1){
+                my @arg_array = ();
+                if($mode_array[$index] eq "t"){
+                    if($name_array[$index] ne ""){
+                        push @arg_array,quote($name_array[$index]);
+                    }
+                    push @arg_array,$MAP_OF_TYPE{$type_array[$index]};
+                    push @returns_table,join(" ",@arg_array);
+                }else{
+                    my $argument = ($mode_array[$index] eq "o" ? "OUT " : "").("" eq $name_array[$index] ? "" : quote($name_array[$index])." ").$MAP_OF_TYPE{$type_array[$index]};
+                    push @argstype_array,$argument;
+                    if($TARGET_VERSION > 4 && exists $MAP_OF_FUNCTION_ARGDEF{$oid."-".$index}){
+                        $argument = $argument." DEFAULT ".$MAP_OF_FUNCTION_ARGDEF{$oid."-".$index};
+                    }
+                    push @argument_array,$argument;
+                }
+            }
+            $arguments = join(", ",@argument_array);
+            $argstype = join(", ",@argstype_array);
+            $create = $create.$arguments;
+        }
+        $create = $create.") RETURNS";
+        if(@returns_table < 1){
+            $create = $create.("t" eq $proretset ? " SETOF" : "")." ".$MAP_OF_TYPE{$prorettype};
+        }else{
+            $create = $create." TABLE(".join(", ",@returns_table).")";
+        }
+        if("-" eq $probin || "" eq $probin){
+            $create = $create.' AS $B2018O12D20Y$'.$prosrc.'$B2018O12D20Y$';
+        }else{
+            $create = $create."\n AS '$probin', '$prosrc'\n";
+        }
+        $create = $create." LANGUAGE ".$MAP_OF_LANGUAGE{$prolang}." ".$volatile{$provolatile}.("t" eq $proisstrict ? " STRICT" : "").("t" eq $prosecdef ? " SECURITY DEFINER" : "");
+        if($TARGET_VERSION > 4){
+            if("" ne $procost){
+                $create = $create." COST ".$procost;
+            }
+            if($proretset eq "t" && $prorows > 0){
+                $create = $create." ROWS ".$prorows;
+            }
+            if("" ne $proconfig){
+                $create = $create."\nSET ".join("\nSET ",decode(split(/,/,$proconfig)));
+            }
+        }
+        $create = $create.";";
+        outputTask($create,\$index,$TAIL_Function);
+        $MAP_OF_FUNCTION{$oid} = qq{$pronamespace.$proname($argstype)};
+        $proowner = $MAP_OF_ROLE{$proowner};
+        output(qq{ALTER FUNCTION $pronamespace.$proname($argstype) OWNER TO $proowner;});
+        if("" ne $proacl){
+            for my $option(split(/,/,$proacl)){
+                my ($role,$value) = split(/:/,$option,2);
+                ($role,$value) = (decode($role),decode($value));
+                $role = "PUBLIC" if "" eq $role;
+                $value =~ s/\/.*$//;
+                output("GRANT ALL ON FUNCTION $pronamespace.$proname($argstype) TO $role;");
+            }
+        }
+    }
+    outputRegionEnd(\$index,$TAIL_Function);
+    $index = 0;
+    for my $row(@result){
+        my ($oid,$proname,$pronamespace,$proowner,$prolang,$proisagg,$prosecdef,$proisstrict,$proretset,$provolatile,$pronargs,$prorettype,
+            $proargtypes,$proallargtypes,$proargmodes,$proargnames,$prosrc,$probin,$proacl,$procost,$prorows,$proconfig) = @$row;
+        ($proname,$prosrc,$pronamespace) = (quote(decode($proname)),decode($prosrc),$MAP_OF_SCHEMA{$pronamespace});
+        if(isTempSchema($pronamespace) || skipThisSchema($pronamespace)){
+            next;
+        }
+        if($proisagg ne "t"){
+            next;
+        }
+        my $drop = qq{DROP AGGREGATE IF EXISTS $pronamespace.$proname(};
+        my $create = qq{CREATE AGGREGATE $pronamespace.$proname(};
+        my $argstype = "";
+        if($pronargs > 0){
+            my @type_array = split(/,/,("" eq $proallargtypes ? $proargtypes : $proallargtypes));
+            my @argstype_array = ();
+            for my $index(0 .. @type_array - 1){
+                my $argument = quote($MAP_OF_TYPE{$type_array[$index]});
+                push @argstype_array,$argument;
+            }
+            $argstype = join(", ",@argstype_array);
+        }
+        $drop = $drop.qq{$argstype);};
+        $create = $create.qq{$argstype)(\n};
+        my ($sfunc,$prefunc,$finalfunc,$stype,$initcond) = @{$MAP_OF_AGG{$oid}};
+        $create = $create.qq{  SFUNC=$sfunc};
+        if($prefunc ne "-"){
+            $create = $create.qq{,\n  PREFUNC=$prefunc};
+        }
+        if($finalfunc ne "-"){
+            $create = $create.qq{,\n  FINALFUNC=$finalfunc};
+        }
+        $create = $create.qq{,\n  STYPE=$stype};
+        if($initcond ne ""){
+            $create = $create.qq{,\n  INITCOND='$initcond';};
+        }
+        $create = $create.qq{\n);};
+        outputTask($drop."\n".$create,\$index,$TAIL_Function);
+        $proowner = $MAP_OF_ROLE{$proowner};
+        output(qq{ALTER AGGREGATE $pronamespace.$proname($argstype) OWNER TO $proowner;});
+        if("" ne $proacl){
+            for my $option(split(/,/,$proacl)){
+                my ($role,$value) = split(/:/,$option,2);
+                ($role,$value) = (decode($role),decode($value));
+                $role = "PUBLIC" if "" eq $role;
+                $value =~ s/\/.*$//;
+                output("GRANT EXECUTE ON FUNCTION $pronamespace.$proname($argstype) TO $role;");
+            }
+        }
+    }
+    outputRegionEnd(\$index,$TAIL_Function);
+}
+sub outputSequence{
+    my $start_attribute = "start_value";
+    if($DATABASE_VERSION < 6){
+        $start_attribute = "last_value AS start_value";
+    }
+    my @result = queryResult($SQL_GET_SEQUENCE);
+    my %temp_hash;
+    my ($index,$all_index) = (0,0);
+    my $sequece_size = @result;
+    my @query_array = ();
+    for my $row(@result){
+        my ($oid,$relnamespace,$relowner,$relname,$relacl) = @$row;
+        ($relname,$relnamespace,$relowner) = (quote(decode($relname)),$MAP_OF_SCHEMA{$relnamespace},$MAP_OF_ROLE{$relowner});
+        $result[$all_index] = [($oid,$relnamespace,$relowner,$relname,$relacl)];
+        ($index,$all_index) = ($index + 1,$all_index + 1);
+        if(!isTempSchema($relnamespace)){
+            push @query_array,qq{SELECT $oid,increment_by,min_value,max_value,last_value,$start_attribute,cache_value,is_cycled FROM $relnamespace.$relname};
+        }
+        if($index == $SQL_BATCH || $all_index == $sequece_size){
+            for my $row(queryResult(join("\nUNION ALL\n",@query_array))){
+                my ($sid,$increment_by,$min_value,$max_value,$last_value,$start_value,$cache_value,$is_cycled) = @$row;
+                $temp_hash{$sid} = [($increment_by,$min_value,$max_value,$last_value,$start_value,$cache_value,$is_cycled)];
+            }
+            @query_array = ();
+            $index = 0;
+        }
+    }
+    my %aclmap = ("U" => "USAGE","r" => "SELECT","w" => "UPDATE");
+    my $index = 0;
+    for my $row(@result){
+        my ($oid,$relnamespace,$relowner,$relname,$relacl) = @$row;
+        if(isTempSchema($relnamespace) || skipThisSchema($relnamespace)){
+            next;
+        }
+        my ($increment_by,$min_value,$max_value,$last_value,$start_value,$cache_value,$is_cycled) = @{$temp_hash{$oid}};
+        my $create_sql = qq{CREATE SEQUENCE $relnamespace.$relname INCREMENT BY $increment_by MINVALUE $min_value MAXVALUE $max_value START $last_value CACHE $cache_value};
+        $create_sql = $create_sql.("t" eq $is_cycled ? " CYCLE" : " NO CYCLE").";";
+        if($last_value ne $start_value){
+            $create_sql = $create_sql.qq{\nALTER SEQUENCE $relnamespace.$relname RESTART $start_value;};
+        }
+        outputTask($create_sql,\$index,$TAIL_Sequence);
+        output(qq{ALTER TABLE $relnamespace.$relname OWNER TO $relowner;});
+        if("" ne $relacl){
+            for my $option(split(/,/,$relacl)){
+                my ($role,$value) = split(/:/,$option,2);
+                ($role,$value) = (decode($role),decode($value));
+                $role = "PUBLIC" if "" eq $role;
+                $value =~ s/\/.*$//;
+                if($role eq $relowner or $value eq "rwU"){
+                    output("GRANT ALL ON SEQUENCE $relnamespace.$relname TO $role;");
+                }else{
+                   my @acl_array;
+                   for my $ac(split(//,$value)){
+                       push @acl_array,$aclmap{$ac};
+                   }
+                   output("GRANT ".join(", ",@acl_array)." ON SEQUENCE $relnamespace.$relname TO $role;");
+                }
+            }
+        }
+    }
+    outputRegionEnd(\$index,$TAIL_Sequence);
+}
+sub getDatabaseTablespace{
+    my @result = queryResult($SQL_GET_DATABASE_TABLESPACE);
+    for my $row(@result){
+        my ($datname,$dattablespace) = @$row;
+        ($datname) = (decode($datname));
+        if($datname eq $DATABASE_NAME){
+            $DATABASE_TABLESPACE = $MAP_OF_TABLESPACE{$dattablespace};
+            last;
+        }
+    }
+    if("" eq $DATABASE_TABLESPACE){
+        errorMessage("Can't find current database's tablespace");
+    }
+}
+sub getTableInformation{
+    my @result;
+    if($DATABASE_VERSION < 6){
+        @result = queryResult($SQL_GET_TABLE);
+    }else{
+        @result = queryResult($SQL_GET_TABLE_V6);
+    }
+    for my $row(@result){
+        my ($oid,$relname,$relnamespace,$relowner,$reltablespace,$relnatts,$relhasoids,$relhassubclass,$relacl,$reloptions,$unlogged,$relkind) = @$row;
+        ($relname,$reloptions,$relnamespace,$relowner) = (quote(decode($relname)),uc($reloptions),$MAP_OF_SCHEMA{$relnamespace},$MAP_OF_ROLE{$relowner});
+        my $tablename = $relnamespace.".".$relname;
+        if(exists $MAP_OF_RELOPTION{$tablename}){
+            $reloptions = $MAP_OF_RELOPTION{$tablename};
+        }
+        $MAP_OF_TABLE{$oid} = [($relname,$relnamespace,$relowner,$reltablespace,$relnatts,$relhasoids,$relhassubclass,$relacl,$reloptions,$unlogged,$relkind)];
+    }
+    @result = queryResult($SQL_GET_PARTITION_ORDER);
+    my %temp_set = ();
+    for my $row(@result){
+        my ($oid) = @$row;
+        if(!exists $MAP_OF_TABLE{$oid}){
+            next;
+        }
+        push @TABLE_PARTITIONS_ORDER_ARRAY,$oid;
+        $temp_set{$oid} = undef;
+    }
+    for my $oid(keys %MAP_OF_TABLE){
+        if(exists $temp_set{$oid} || exists $MAP_OF_PARTITION_OID{$oid}){
+            next;
+        }
+        push @TABLE_PARTITIONS_ORDER_ARRAY,$oid;
+    }
+}
+sub getPartitionInformation{
+    my @result = queryResult($SQL_GET_PARTITION);
+    for my $row(@result){
+        my ($oid,$parrelid,$parkind,$parlevel,$paristemplate,$paratts) = @$row;
+        my @attibute_array;
+        for my $att(split(/,/,$paratts)){
+            my $key = $parrelid."-".$att;
+            my ($attname,$atttype,$attnotnull,$atthasdef,$attisdropped) = @{$MAP_OF_ATTRIBUTE{$key}};
+            push @attibute_array,$attname;
+        }
+        $paratts = join(",",@attibute_array);
+        my @partition_array;
+        if(exists $MAP_OF_PARTITION{$parrelid}){
+            @partition_array = @{$MAP_OF_PARTITION{$parrelid}};
+        }
+        push @partition_array,[($oid,$parkind,$parlevel,$paristemplate,$paratts)];
+        $MAP_OF_PARTITION{$parrelid} = [@partition_array];
+    }
+    @result = queryResult($SQL_GET_PARTITION_RULE);
+    for my $row(@result){
+        my ($oid,$paroid,$parchildrelid,$parparentrule,$parname,$parisdefault,$parruleord,$parrangestartincl,$parrangeendincl,
+            $parrangestart,$parrangeend,$rule_def) = @$row;
+        ($parname,$parrangestart,$parrangeend,$rule_def) = (decode($parname),decode($parrangestart),decode($parrangeend),decode($rule_def));
+        if($parname eq ""){
+            my $relation = @{$MAP_OF_TABLE{$parchildrelid}}[0];
+            $parname = $relation;
+            $parname =~ s/^.+_prt_//;
+        }
+        $parname = quote($parname);
+        my $key = "0" eq $parparentrule ? $paroid."-".$parparentrule : $parparentrule;
+        my @rule_array;
+        if(exists $MAP_OF_PARTITION_RULE{$key}){
+            @rule_array = @{$MAP_OF_PARTITION_RULE{$key}};
+        }
+        push @rule_array,[($oid,$parchildrelid,$parname,$parisdefault,$parruleord,$parrangestartincl,$parrangeendincl,$parrangestart,$parrangeend,trim($rule_def))];
+        $MAP_OF_PARTITION_RULE{$key} = [@rule_array];
+        $MAP_OF_PARTITION_OID{$parchildrelid} = "";
+    }
+}
+sub getTableConstraintCheck{
+    my @result = queryResult($SQL_GET_TABLE_CHECK);
+    for my $row(@result){
+        my ($conrelid,$conname,$condef) = @$row;
+        ($conname,$condef) = (quote(decode($conname)),decode($condef));
+        my @constraint_array = ();
+        if(exists $MAP_OF_TABLECHECK{$conrelid}){
+            @constraint_array = @{$MAP_OF_TABLECHECK{$conrelid}};
+        }
+        push @constraint_array,[($conname,$condef)];
+        $MAP_OF_TABLECHECK{$conrelid} = [@constraint_array];
+    }
+}
+sub getNextLevelPartition{
+    my ($key,$level,$paroptions) = @_;
+    my @rule_array = @{$MAP_OF_PARTITION_RULE{$key}};
+    my @partition_array;
+    for my $row(@rule_array){
+        my ($oid,$parchildrelid,$parname,$parisdefault,$parruleord,$parrangestartincl,$parrangeendincl,$parrangestart,$parrangeend,$rule_def) = @$row;
+        my $class_option = @{$MAP_OF_TABLE{$parchildrelid}}[8];
+        if($class_option eq ""){
+            $class_option = "APPENDONLY=FALSE";
+        }
+        my $nextKey = $oid;
+        if($rule_def =~ /\s*WITH\s*\(.*\)\s*/){
+            $rule_def =~ s/\s*WITH\s*\(.*\)\s*/ WITH($class_option) /;
+        }else{
+            if($rule_def =~ /\s*TABLESPACE\s*/){
+                $rule_def =~ s/\s*TABLESPACE\s*/ WITH($class_option) TABLESPACE /;
+            }else{
+                $rule_def = $rule_def." WITH($class_option)";
+            }
+        }
+        $rule_def =~ s/\s+EVERY\s+\([^\(]+\)//;
+        $rule_def =~ s/\s+$//;
+        if(not $rule_def =~ /^PARTITION |^SUBPARTITION |^DEFAULT PARTITION |^DEFAULT SUBPARTITION /){
+            $rule_def = ($level > 1 ? "SUBPARTITION " : "PARTITION ").$parname." ".$rule_def;
+        }
+        if(exists $MAP_OF_PARTITION_RULE{$nextKey}){
+            push @partition_array,($INDENT x $level).$rule_def."\n".($INDENT x $level)."(\n".getNextLevelPartition($nextKey,$level + 1,$class_option)."\n".($INDENT x $level).")";
+        }else{
+            push @partition_array,($INDENT x $level).$rule_def;
+        }
+    }
+    return join(",\n",@partition_array);
+}
+sub getPartitionTemplate{
+    my ($tablename,$template_list) = @_;
+    my @template_array = @$template_list;
+    @template_array =  sort {$b->[2] <=> $a->[2]} @template_array;
+    my $alter = "";
+    for my $template(@template_array){
+        my ($par_oid,$parkind,$parlevel,$paristemplate,$paratts) = @$template;
+        $alter = $alter."ALTER TABLE $tablename".(" ALTER PARTITION FOR (RANK(1))" x ($parlevel - 1))." SET SUBPARTITION TEMPLATE"."\n";
+        my $key = $par_oid."-"."0";
+        my @rule_array = @{$MAP_OF_PARTITION_RULE{$key}};
+        my @partition_array;
+        for my $row(@rule_array){
+            my ($oid,$parchildrelid,$parname,$parisdefault,$parruleord,$parrangestartincl,$parrangeendincl,$parrangestart,$parrangeend,$rule_def) = @$row;
+            $rule_def =~ s/\s+$//;
+            push @partition_array,$INDENT.$rule_def;
+        }
+        $alter = $alter."(\n".join(",\n",@partition_array)."\n)\n;\n";
+    }
+    return "" eq $alter ? "" : "\n".$alter;
+}
+sub getPartitionDefinition{
+    my ($oid,$tablename,$parentoptions) = @_;
+    my @partition_array = @{$MAP_OF_PARTITION{$oid}};
+    my @top_partition;
+    my @template_array,
+    my $partition_sql = "\n";
+    for my $partition(@partition_array){
+        my ($par_oid,$parkind,$parlevel,$paristemplate,$paratts) = @$partition;
+        if("t" eq $paristemplate){
+            push @template_array,[($par_oid,$parkind,$parlevel,$paristemplate,$paratts)];
+            next;
+        }
+        if("0" eq $parlevel){
+            push @top_partition,$par_oid;
+            $partition_sql = $partition_sql."PARTITION BY ".("l" eq $parkind ? "LIST" : "RANGE")."($paratts)\n";
+        }else{
+            $partition_sql = $partition_sql."SUBPARTITION BY ".("l" eq $parkind ? "LIST" : "RANGE")."($paratts)\n";
+        }
+    }
+    $partition_sql = $partition_sql."(\n";
+    for my $par_oid(@top_partition){
+        $partition_sql = $partition_sql.getNextLevelPartition($par_oid."-"."0",1,$parentoptions);
+    }
+    $partition_sql = $partition_sql."\n);".getPartitionTemplate($tablename,\@template_array);
+    return $partition_sql;
+}
+sub getRelationAuth{
+    my ($relnamespace,$relname,$relowner,$relacl) = @_;
+    my @auth_array;
+    for my $acl(split(/,/,$relacl)){
+        my ($role,$value) = split(/:/,$acl,2);
+        ($role,$value) = (decode($role),decode($value));
+        $role = "PUBLIC" if "" eq $role;
+        $value =~ s/\/.*$//;
+        if($role eq $relowner){
+            push @auth_array,"REVOKE ALL ON TABLE $relnamespace.$relname FROM $role;";
+        }
+        my $grantoption = "";
+        if($value =~ /\*/){
+            $grantoption = " WITH GRANT OPTION";
+            $value =~ s/\*//g;
+        }
+        if($value eq "arwdDxt"){
+            push @auth_array,"GRANT ALL ON TABLE $relnamespace.$relname TO $role".$grantoption.";";
+        }else{
+           my @acl_array;
+           for my $ac(split(//,$value)){
+               push @acl_array,$RELATION_ACL_MAP{$ac};
+           }
+           push @auth_array,"GRANT ".join(", ",@acl_array)." ON TABLE $relnamespace.$relname TO $role".$grantoption.";";
+        }
+    }
+    return join("\n",@auth_array)
+}
+sub outputTable{
+    my $index = 0;
+    for my $oid(@TABLE_PARTITIONS_ORDER_ARRAY){
+        my ($relname,$relnamespace,$relowner,$reltablespace,$relnatts,$relhasoids,$relhassubclass,$relacl,$reloptions,$unlogged,$relkind) = @{$MAP_OF_TABLE{$oid}};
+        if(isTempSchema($relnamespace) || skipThisSchema($relnamespace) || exists $MAP_OF_PARTITION_OID{$oid} || $relkind eq "m"){
+            next;
+        }elsif(!exists $MAP_OF_ATTRIBUTE{$oid."-"."1"} || !exists $MAP_OF_ATTRIBUTE{$oid."-".$relnatts}){
+            outwarn("Table $relnamespace.$relname missing attributes");
+            next;
+        }elsif(!exists $MAP_OF_DISTRIBUTION{$oid}){
+            outwarn("Table $relnamespace.$relname has no correct distribution key");
+            next;
+        }
+        my @attibute_array;
+        for my $relattindex(1 .. $relnatts){
+            my $key = $oid."-".$relattindex;
+            my ($attname,$atttype,$attnotnull,$atthasdef,$attisdropped) = @{$MAP_OF_ATTRIBUTE{$key}};
+            if("t" eq $attisdropped){
+                next;
+            }
+            my $attr_sql = $attname."    ".$atttype;
+            if("t" eq $attnotnull){
+                $attr_sql = $attr_sql." NOT NULL";
+            }
+            if("t" eq $atthasdef){
+                $attr_sql = $attr_sql." DEFAULT ".$MAP_OF_ATTRDEF{$key};
+            }
+            push @attibute_array,$attr_sql;
+        }
+        my $distribution = $MAP_OF_DISTRIBUTION{$oid};
+        my $create = "CREATE ".($unlogged eq "t" ? "UNLOGGED " : "").qq{TABLE $relnamespace.$relname(\n};
+        $create = $create.join(",\n",@attibute_array);
+        $create = $create."\n)\n";
+        $create = $create."WITH(OIDS=".("f" eq $relhasoids ? "FALSE" : "TRUE").("" eq $reloptions ? "" : ",".$reloptions).")\n";
+        if("0" ne $reltablespace){
+            $create = $create."TABLESPACE ".$MAP_OF_TABLESPACE{$reltablespace}."\n";
+        }
+        $create = $create.$distribution;
+        if("t" eq $relhassubclass && exists $MAP_OF_PARTITION{$oid}){
+            $create = $create.getPartitionDefinition($oid,$relnamespace.".".$relname,$reloptions)."\n";
+        }else{
+            $create = $create."\n;\n";
+        }
+        outputTask($create,\$index,$TAIL_Table);
+        output(qq{ALTER TABLE $relnamespace.$relname OWNER TO $relowner;});
+        if($relacl ne ""){
+            output(getRelationAuth($relnamespace,$relname,$relowner,$relacl));
+        }
+        if(exists $MAP_OF_TABLECHECK{$oid}){
+            for my $check(@{$MAP_OF_TABLECHECK{$oid}}){
+                my ($conname,$condef) = @$check;
+                output(qq{ALTER TABLE $relnamespace.$relname ADD CONSTRAINT $conname $condef;});
+            }
+        }
+    }
+    outputRegionEnd(\$index,$TAIL_Table);
+}
+sub formatFmtOpts{
+    my ($fmttype,$fmtopts) = @_;
+    if($fmtopts eq ""){
+        return "";
+    }
+    $fmtopts =~ s/\\/\\\\/g;
+    $fmtopts =~ s/\t/\\t/g;
+    $fmtopts =~ s/\n/\\n/g;
+    my @array = split(//,$fmtopts);
+    my $result = "";
+    my $inSingleQuote = 0;
+    my $item = "";
+    my $index = 0;
+    my $size = @array;
+    my $left = 1;
+    for my $curr(@array){
+        $index ++;
+        my $ascii = ord($curr);
+        if($curr eq "'"){
+            $inSingleQuote = !$inSingleQuote;
+        }elsif($inSingleQuote && ($ascii <= 31 || $ascii == 127)){
+            $curr = '\x'.sprintf('%.2X',$ascii);
+        }
+        $item = $item.$curr;
+        if(!$inSingleQuote && ($curr eq ' ' || $index == $size)){
+            $item = trim($item);
+            if($item =~ /\\/){
+                $item = "E".$item;
+            }
+            if($fmttype eq "b"){
+                $result = $result.($left == 1 ? "" : " = ").$item.($left == 1 ? "" : ",");
+                $left = 1 - $left;
+            }else{
+                $result = $result." ".$item;
+            }
+            $item = "";
+        }
+    }
+    if($inSingleQuote){
+        errorMessage("Can not split:\n".$fmtopts);
+    }
+    $result =~ s/,$//;
+    return trim($result);
+}
+sub getExtFormat{
+    my @result;
+    if($DATABASE_VERSION < 5){
+        @result = queryResult($SQL_GET_EXTTABLE_FMT_V4);
+    }elsif($DATABASE_VERSION == 5){
+        @result = queryResult($SQL_GET_EXTTABLE_FMT_V5);
+    }else{
+        @result = queryResult($SQL_GET_EXTTABLE_FMT_V6);
+    }
+    for my $row(@result){
+        my ($reloid,$location,$fmttype,$fmtopts,$command,$rejectlimit,$rejectlimittype,$fmterrtbl,$encoding,$writable,$logerrors) = @$row;
+        ($fmtopts,$command) = (decode($fmtopts),decode($command));
+        my @location_list = split(/,/,$location);
+        @location_list = decode(@location_list);
+        $fmtopts = formatFmtOpts($fmttype,$fmtopts);
+        $MAP_OF_EXTTABLE_FMT{$reloid} = [([@location_list],$fmttype,$fmtopts,$command,$rejectlimit,$rejectlimittype,$fmterrtbl,$encoding,$writable,$logerrors)];
+    }
+}
+sub outputExtTable{
+    my @result = queryResult($SQL_GET_EXTTABLE);
+    my $index = 0;
+    for my $row(@result){
+        my ($oid,$relname,$relnamespace,$relowner,$relnatts,$relacl) = @$row;
+        my $raw_relname = decode($relname);
+        ($relname,$relnamespace) = (quote($raw_relname),$MAP_OF_SCHEMA{$relnamespace});
+        if(isTempSchema($relnamespace) || skipThisSchema($relnamespace)){
+            next;
+        }elsif((!exists $MAP_OF_ATTRIBUTE{$oid."-"."1"} || !exists $MAP_OF_ATTRIBUTE{$oid."-".$relnatts}) && !exists $MAP_OF_PARTITION_OID{$oid}){
+            outwarn("External table $relnamespace.$relname missing attributes");
+            next;
+        }
+        if(exists $MAP_OF_PARTITION_OID{$oid}){
+            srand();
+            $relname = "ext_part_".int(rand(1E8)).int(rand(1E8)).int(rand(1E8));
+        }
+        my ($location,$fmttype,$fmtopts,$command,$rejectlimit,$rejectlimittype,$fmterrtbl,$encoding,$writable,$logerrors) = @{$MAP_OF_EXTTABLE_FMT{$oid}};
+        my $create = "CREATE ".($writable eq "t" ? "WRITABLE" : "READABLE")." EXTERNAL ".("" eq $command ? "TABLE " : "WEB TABLE ").$relnamespace.".".$relname."(\n";
+        my @attibute_array;
+        if(exists $MAP_OF_PARTITION_OID{$oid}){
+            push @attibute_array,"LIKE ".$relnamespace.".".quote($raw_relname);
+        }else{
+            for my $relattindex(1 .. $relnatts){
+                my $key = $oid."-".$relattindex;
+                my ($attname,$atttype,$attnotnull,$atthasdef) = @{$MAP_OF_ATTRIBUTE{$key}};
+                my $attr_sql = $attname."    ".$atttype;
+                if("t" eq $atthasdef){
+                    $attr_sql = $attr_sql." DEFAULT ".$MAP_OF_ATTRDEF{$key};
+                }
+                push @attibute_array,$attr_sql;
+            }
+        }
+        $create = $create.join(",\n",@attibute_array);
+        $create = $create."\n)\n";
+        if("" eq $command){
+            $create = $create."LOCATION(\n$INDENT'".join("',\n$INDENT'",@$location)."'\n)";
+        }else{
+            $command =~ s/'/''/g;
+            $create = $create."EXECUTE '$command' ";
+            my ($on_host,$on_value) = split(":",(@$location)[0]);
+            if($on_host eq "ALL_SEGMENTS"){
+                $on_host = "ON ALL";
+            }elsif($on_host eq "HOST"){
+                $on_host = "ON HOST ".$on_value;
+            }elsif($on_host eq "MASTER_ONLY"){
+                $on_host = "ON MASTER";
+            }elsif($on_host eq "PER_HOST"){
+                $on_host = "ON HOST";
+            }elsif($on_host eq "SEGMENT_ID"){
+                $on_host = "ON SEGMENT ".$on_value;
+            }elsif($on_host eq "TOTAL_SEGS"){
+                $on_host = "ON ".$on_value
+            }else{
+                errorMessage("Unidentified external table execute definition: $on_host $on_value");
+            }
+            $create = $create.$on_host;
+        }
+        $create = $create."\nFORMAT '".$EXT_FORMAT_TYPE_MAP{$fmttype}."'";
+        $create = $create."(\n$fmtopts\n)";
+        $create = $create."\n"."ENCODING '".$encoding."'";
+        if("" ne $fmterrtbl || "" ne $rejectlimit){
+            $create = $create."\n";
+        }
+        if("" ne $fmterrtbl){
+            if(exists $MAP_OF_TABLE{$fmterrtbl} && $TARGET_VERSION < 5){
+                my ($t_relname,$t_relnamespace) = @{$MAP_OF_TABLE{$fmterrtbl}};
+                $create = $create."LOG ERRORS INTO $t_relnamespace.$t_relname ";
+            }else{
+                $create = $create."LOG ERRORS ";
+            }
+        }elsif("t" eq $logerrors){
+            $create = $create."LOG ERRORS ";
+        }
+        if("" ne $rejectlimit){
+            $create = $create."SEGMENT REJECT LIMIT $rejectlimit ".("p" eq $rejectlimittype ? "PERCENT" : "ROWS");
+        }
+        $create = $create.";\n";
+        outputTask($create,\$index,$TAIL_ExtTable);
+        $relowner = $MAP_OF_ROLE{$relowner};
+        if(exists $MAP_OF_PARTITION_OID{$oid}){
+            my @partition_name = split(/_\d+_prt_/,$raw_relname);
+            my ($index,$max_index) = (0,@partition_name - 1);
+            my $exchange_sql = "";
+            for my $par(@partition_name){
+                if($index == 0){
+                    $exchange_sql = "ALTER TABLE ".$relnamespace.".".quote($par);
+                }elsif($index == $max_index){
+                    $exchange_sql = $exchange_sql." EXCHANGE PARTITION ".quote($par);
+                }else{
+                    $exchange_sql = $exchange_sql." ALTER PARTITION ".quote($par);
+                }
+                $index++;
+            }
+            output($exchange_sql." WITH TABLE ".$relnamespace.".".$relname." WITHOUT VALIDATION;");
+            output("DROP TABLE ".$relnamespace.".".$relname.";");
+        }else{
+            output(qq{ALTER EXTERNAL TABLE $relnamespace.$relname OWNER TO $relowner;});
+            if($relacl ne ""){
+                output(getRelationAuth($relnamespace,$relname,$relowner,$relacl));
+            }
+        }
+    }
+    outputRegionEnd(\$index,$TAIL_ExtTable);
+}
+sub getViewDepth{
+    my @result = queryResult($SQL_GET_VIEW_DEPEND);
+    my %map_of_view_depend;
+    for my $row(@result){
+        my ($vid,$tid,$kind) = @$row;
+        my @ref_array = ();
+        if(exists $map_of_view_depend{$vid}){
+            @ref_array = @{$map_of_view_depend{$vid}};
+        }
+        push @ref_array,[($tid,$kind)];
+        $map_of_view_depend{$vid} = [@ref_array];
+    }
+    my $depth = 1;
+    while(1 == 1){
+        my @key_for_delete;
+        for my $key(keys %map_of_view_depend){
+            my $expend = 1;
+            for my $row(@{$map_of_view_depend{$key}}){
+                my ($tid,$kind) = @$row;
+                if("v" eq $kind && exists $map_of_view_depend{$tid}){
+                    $expend = 0;
+                }
+            }
+            if($expend){
+                $MAP_OF_VIEW_DEPTH{$key} = $depth;
+                push @key_for_delete,$key;
+            }
+        }
+        for my $key(@key_for_delete){
+            delete $map_of_view_depend{$key};
+        }
+        if(keys %map_of_view_depend == 0){
+            last;
+        }
+        if(@key_for_delete < 1){
+            errorMessage("Some view may have circular depend.");
+        }
+        $depth += 1;
+    }
+}
+sub outputView{
+    my @result = queryResult($SQL_GET_VIEW);
+    my @temp_depth_array;
+    for my $row(@result){
+        my ($relnamespace,$reltablespace,$relkind,$oid,$relowner,$relacl,$reloptions,$relname,$viewdef) = @$row;
+        ($relname,$viewdef,$relnamespace,$relowner) = (quote(decode($relname)),decode($viewdef),$MAP_OF_SCHEMA{$relnamespace},$MAP_OF_ROLE{$relowner});
+        my $depth = $MAP_OF_VIEW_DEPTH{$oid};
+        if("" eq $depth){
+            $depth = 0;
+        }
+        if("" eq $temp_depth_array[$depth]){
+            $temp_depth_array[$depth] = [()];
+        }
+        my @view_array = @{$temp_depth_array[$depth]};
+        push @view_array,[($relnamespace,$reltablespace,$relkind,$oid,$relowner,$relacl,$reloptions,$relname,trim($viewdef))];
+        $temp_depth_array[$depth] = [@view_array];
+    }
+    for my $depth_list(@temp_depth_array){
+        my $index = 0;
+        for my $row(@$depth_list){
+            my ($relnamespace,$reltablespace,$relkind,$oid,$relowner,$relacl,$reloptions,$relname,$viewdef) = @$row;
+            if(isTempSchema($relnamespace) || skipThisSchema($relnamespace)){
+                next;
+            }
+            if($relkind eq "m"){
+                outputTask(qq{DROP MATERIALIZED VIEW IF EXISTS $relnamespace.$relname CASCADE;},\$index,$TAIL_View);
+                if($reloptions eq ""){
+                    $reloptions = "APPENDONLY=FALSE";
+                }
+                $viewdef =~ s/;$/ $MAP_OF_DISTRIBUTION{$oid};/;
+                output(qq{CREATE MATERIALIZED VIEW $relnamespace.$relname WITH($reloptions)}.("0" eq $reltablespace ? "" : " TABLESPACE ".$MAP_OF_TABLESPACE{$reltablespace}).qq{ AS $viewdef});
+            }else{
+                outputTask(qq{CREATE OR REPLACE VIEW $relnamespace.$relname AS $viewdef},\$index,$TAIL_View);
+            }
+            output(qq{ALTER TABLE $relnamespace.$relname OWNER TO $relowner;});
+            if($relacl ne ""){
+                output(getRelationAuth($relnamespace,$relname,$relowner,$relacl));
+            }
+        }
+        outputRegionEnd(\$index,$TAIL_View);
+    }
+}
+sub outputIndex{
+    my @result = queryResult($SQL_GET_INDEX);
+    my $index = 0;
+    for my $row(@result){
+        my ($relid,$indexname,$ispkey,$relnamespace,$indexdef) = @$row;
+        $relnamespace = $MAP_OF_SCHEMA{$relnamespace};
+        if(!exists $MAP_OF_TABLE{$relid}){
+            outwarn("Index with oid $relid missing table information");
+            next;
+        }
+        my ($relname,$nspname) = @{$MAP_OF_TABLE{$relid}};
+        if(isTempSchema($relnamespace) || skipThisSchema($relnamespace) || isTempSchema($nspname) || skipThisSchema($nspname)){
+            next;
+        }
+        ($indexname,$indexdef) = decode($indexname,$indexdef);
+        if($ispkey eq "t"){
+            my $columns = (split(/ USING \w+ /,$indexdef))[1];
+            my $sql = qq{ALTER TABLE $nspname.$relname ADD CONSTRAINT }.quote($indexname).qq{ PRIMARY KEY $columns;};
+            outputTask($sql,\$index,$TAIL_Index);
+        }else{
+            my ($create,$def) = split(/ ON /,$indexdef,2);
+            my ($check_schema) = split(/\./,$def,2);
+            if($check_schema ne $nspname){
+                $def = $nspname.".".$def;
+            }
+            outputTask(qq{$create ON $def;},\$index,$TAIL_Index);
+        }
+    }
+    outputRegionEnd(\$index,$TAIL_Index);
+}
+sub outputDefPri{
+    if($DATABASE_VERSION < 6){
+        return;
+    }
+    my @result = queryResult($SQL_GET_DEF_PRI);
+    my $index = 0;
+    for my $row(@result){
+        my ($defaclrole,$defaclnamespace,$defaclobjtype,$defaclacl) = @$row;
+        if($defaclacl eq ""){
+            next;
+        }
+        $defaclrole = $MAP_OF_ROLE{$defaclrole};
+        if($defaclnamespace eq "0"){
+            $defaclnamespace = "";
+        }else{
+            $defaclnamespace = $MAP_OF_SCHEMA{$defaclnamespace};
+        }
+        my $pre_sql = "ALTER DEFAULT PRIVILEGES FOR ROLE $defaclrole".($defaclnamespace eq "" ? "" : " IN SCHEMA ".$defaclnamespace)." ";
+        for my $option(split(/,/,$defaclacl)){
+            my ($role,$value) = split(/:/,$option,2);
+            ($role,$value) = (decode($role),decode($value));
+            $role = "PUBLIC" if "" eq $role;
+            $value =~ s/\/.*$//;
+            my $grantoption = "";
+            if($value =~ /\*/){
+                $grantoption = " WITH GRANT OPTION";
+                $value =~ s/\*//g;
+            }
+            if($defaclobjtype eq "r"){
+                outputTask($pre_sql."REVOKE ALL ON TABLES FROM $role;",\$index,$TAIL_DefPri);
+                if($value eq "arwdDxt"){
+                    output($pre_sql."GRANT ALL ON TABLES TO $role".$grantoption.";");
+                }else{
+                    my @acl_array;
+                    for my $ac(split(//,$value)){
+                        push @acl_array,$RELATION_ACL_MAP{$ac};
+                    }
+                    output($pre_sql."GRANT ".join(", ",@acl_array)." ON TABLES TO $role".$grantoption.";");
+                }
+            }elsif($defaclobjtype eq "S"){
+                outputTask($pre_sql."REVOKE ALL ON SEQUENCES FROM $role;",\$index,$TAIL_DefPri);
+                if($role eq $role or $value eq "rwU"){
+                    output($pre_sql."GRANT ALL ON SEQUENCES TO $role".$grantoption.";");
+                }else{
+                    my @acl_array;
+                    for my $ac(split(//,$value)){
+                        push @acl_array,$SEQUENCE_ACL_MAP{$ac};
+                    }
+                    output($pre_sql."GRANT ".join(", ",@acl_array)." ON SEQUENCES TO $role".$grantoption.";");
+                }
+            }elsif($defaclobjtype eq "f"){
+                outputTask($pre_sql."REVOKE ALL ON FUNCTIONS FROM $role;",\$index,$TAIL_DefPri);
+                output($pre_sql."GRANT ALL ON FUNCTIONS TO $role".$grantoption.";");
+            }elsif($defaclobjtype eq "T"){
+                outputTask($pre_sql."REVOKE ALL ON TYPES FROM $role;",\$index,$TAIL_DefPri);
+                output($pre_sql."GRANT ALL ON TYPES TO $role".$grantoption.";");
+            }
+        }
+    }
+    outputRegionEnd(\$index,$TAIL_DefPri);
+}
+sub outputComment{
+    my @result = queryResult($SQL_GET_COMMENT);
+    my $index = 0;
+    for my $row(@result){
+        my ($objoid,$classoid,$objsubid,$description) = @$row;
+        ($description) = (decode($description));
+        $description =~ s/'/''/g;
+        my ($namespace,$output,$t_relname) = ("","","");
+        if("1259" eq $classoid){
+            if(! exists $MAP_OF_TABLE{$objoid}){
+                next;
+            }
+            ($t_relname,$namespace) = @{$MAP_OF_TABLE{$objoid}};
+            if("0" eq $objsubid){
+                $output = qq{COMMENT ON TABLE $namespace.$t_relname IS '$description';};
+            }else{
+                my $key = $objoid."-".$objsubid;
+                if(! exists $MAP_OF_ATTRIBUTE{$key}){
+                    next;
+                }
+                my ($attname) = @{$MAP_OF_ATTRIBUTE{$key}};
+                $output = qq{COMMENT ON COLUMN $namespace.$t_relname.$attname IS '$description';};
+            }
+        }elsif("1255" eq $classoid){
+            if(! exists $MAP_OF_FUNCTION{$objoid}){
+                next;
+            }
+            my $function = $MAP_OF_FUNCTION{$objoid};
+            $output = qq{COMMENT ON FUNCTION $function IS '$description';};
+        }elsif("2615" eq $classoid){
+            if(! exists $MAP_OF_SCHEMA{$objoid}){
+                next;
+            }
+            $namespace = $MAP_OF_SCHEMA{$objoid};
+            $output = qq{COMMENT ON SCHEMA $namespace IS '$description';};
+        }
+        if($output eq "" || isTempSchema($namespace) || skipThisSchema($namespace)){
+            next;
+        }
+        outputTask($output,\$index,$TAIL_Comment);
+    }
+    outputRegionEnd(\$index,$TAIL_Comment);
+}
+sub main{
+    getOption();
+    checkOption();
+    getVersion();
+    getKeyWord();
+    checkLanguage();
+    checkEncodeFunction();
+    outputResourceQueue();
+    outputResourceGroup();
+    outputRole();
+    outputTablespace();
+    outputRoleSetting();
+    outputLanguage();
+    outputSchema();
+    getTypeInformation();
+    getAttributeInformation();
+    outputCompType();
+    outputEnum();
+    outputDomain();
+    getFunctionArgDef();
+    getAggInformation();
+    outputFunction();
+    outputSequence();
+    getDatabaseTablespace();
+    getTableInformation();
+    getPartitionInformation();
+    getTableConstraintCheck();
+    outputTable();
+    getExtFormat();
+    outputExtTable();
+    getViewDepth();
+    outputView();
+    outputIndex();
+    outputDefPri();
+    outputComment();
+}
+STDOUT->autoflush(1);
+STDERR->autoflush(1);
+main();
