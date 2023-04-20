@@ -1,13 +1,6 @@
 # hdmagic
 Tool that help you with manage your database
 
-不得将代码用于任何商业目的  
-旨在分享----个人行为  
-作者：
-陈淼
-邮箱：
-miaochen@mail.ustc.edu.cn      
-
 截止目前，安装、备份、恢复、同步、ddl备份恢复等已经全面支持GP6版本！！！！！！    
 
 ！！！【在5.20.0和5.20.1版本上暂时无法使用gpmcbackup命令，因为存在Utility模式COPY问题，BUG】！！！ 
