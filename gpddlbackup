@@ -46,7 +46,7 @@ import base64
 if str == None:
     return ""
 return base64.b64encode(str).replace("\n","")
-$$ language plpythonu;
+$$ language plpython3u;
 
 CREATE OR REPLACE FUNCTION gp_toolkit.mcencode(strs text[]) returns varchar as $$
 import base64
@@ -56,14 +56,14 @@ output = []
 for str in strs:
     output.append(base64.b64encode(str))
 return ",".join(output).replace("\n","")
-$$ language plpythonu;
+$$ language plpython3u;
 
 CREATE OR REPLACE FUNCTION gp_toolkit.mcencode(str name) returns varchar as $$
 import base64
 if str == None:
     return ""
 return base64.b64encode(str).replace("\n","")
-$$ language plpythonu;
+$$ language plpython3u;
 
 CREATE OR REPLACE FUNCTION gp_toolkit.mcencode(acls aclitem[]) returns varchar as $$
 import base64
@@ -86,7 +86,7 @@ for acl in acls:
         plpy.error("Can not split: %s" % (acl))
     output.append(base64.b64encode(key)+":"+base64.b64encode(val))
 return ",".join(output).replace("\n","")
-$$ language plpythonu;
+$$ language plpython3u;
 #;
 
 my $SQL_GET_RESOURCE_QUEUE = q#SELECT oid,gp_toolkit.mcencode(rsqname),
@@ -554,9 +554,9 @@ sub getKeyWord{
     }
 }
 sub checkLanguage{
-    my $result = queryResult("select 1 from pg_language where lanname='plpythonu';","Scalar");
+    my $result = queryResult("select 1 from pg_language where lanname='plpython3u';","Scalar");
     if("" eq $result){
-        queryResult("create language plpythonu;");
+        queryResult("create language plpython3u;");
     }
 }
 sub checkEncodeFunction{
